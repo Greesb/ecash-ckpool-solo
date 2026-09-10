@@ -10,7 +10,7 @@ To use with eCash, use the -x | --ecash commmand line option (see below). See
 also the sample eCash configuration (ckpool.ecash.conf).
 
 Link to the source repository:
-https://bitbucket.org/ckolivas/ckpool-solo/src/solobtc/
+https://bitbucket.org/ckolivas/ckpool/src
 
 ---
 CKPOOL + CKPROXY + libckpool by Con Kolivas
