@@ -633,12 +633,27 @@ void b58tobin(char *b58bin, const char *b58);
 int safecmp(const char *a, const char *b);
 bool cmdmatch(const char *buf, const char *cmd);
 
-int address_to_txn(char *p2h, const char *addr, const bool script, const bool segwit);
+int address_to_txn(char *p2h, const char *addr, const bool script, const bool segwit, const bool cashaddr);
 bool txn_to_address(char *addr, const size_t alen, const uchar *script, const int slen,
 		    const char *ref);
 int coinbase_payout_script(uchar *script, int *slen, int64_t *value, const uchar *cb1,
 			   const int cb1len, const int holelen, const uchar *cb2,
 			   const int cb2len);
+/**
+ * @brief Decode a cash address. Only 20 bytes hashes are supported.
+ * 
+ * @param[in] addr The full address string
+ * @param[out] prefix The prefix string. Should be allocated with at least
+ *                    prefix_len bytes.
+ * @param[in] prefix_len The length in bytes of the prefix string.
+ * @param[out] script Whether this is a script address.
+ * @param[out] p2h The pubkey/script hash. Should be allocated with at least 20
+ *                 bytes.
+ * @return true if decoding was successful.
+ * @return false if decoding failed, and the out params should not be relied
+ *               upon.
+ */
+bool decode_cashaddr(const char *addr, char *prefix, int prefix_len, bool *script, char *hash);
 int ser_number(uchar *s, int32_t val);
 int get_sernumber(uchar *s);
 bool fulltest(const uchar *hash, const uchar *target);
@@ -673,7 +688,7 @@ double le256todouble(const uchar *target);
 double be256todouble(const uchar *target);
 double diff_from_target(uchar *target);
 double diff_from_betarget(uchar *target);
-double diff_from_nbits(char *nbits);
+double diff_from_nbits(const char *nbits);
 void target_from_diff(uchar *target, double diff);
 
 void gen_hash(uchar *data, uchar *hash, int len);

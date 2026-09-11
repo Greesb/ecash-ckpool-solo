@@ -1,5 +1,6 @@
 /*
  * Copyright 2014-2018,2023,2026 Con Kolivas
+ * Copyright 2023 The eCash developers
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -257,6 +258,55 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	gbt->gbtdoc = yyjson_mut_doc_imut_copy(mut_doc, &ckyyalc);
 	gbt->gbtroot = yyjson_doc_get_root(gbt->gbtdoc);
 	yyjson_mut_doc_free(mut_doc);
+
+	gbt->rtt_diff = gbt->diff;
+
+	// XEC only.
+	if (ckpool.ecash) {
+		yyjson_val *coinbasetxn, *minerfund, *rtt;
+		const char *minerfund_addr, *rtt_bits_hex;
+		uint64_t minerfund_amount;
+		bool script, segwit;
+		char *minerfundtxn;
+		char rtt_bits[4];
+
+		coinbasetxn = yyjson_obj_get(res_val, "coinbasetxn");
+
+		minerfund = yyjson_obj_get(coinbasetxn, "minerfund");
+		// Send all to a single address
+		minerfund_addr = yyjson_get_str(yyjson_arr_get(yyjson_obj_get(minerfund, "addresses"), 0));
+		// Remain 0 if minerfund is disabled
+		gbt->minerfund_amount = 0;
+		if (minerfund_addr) {
+			gbt->minerfund_amount = yyjson_get_int(yyjson_obj_get(minerfund, "minimumvalue"));
+			char minerfund_prefix[16];
+			char minerfund_hash[20];
+			if (!decode_cashaddr(minerfund_addr, minerfund_prefix, 16, &script, minerfund_hash)) {
+				return false;
+			}
+			gbt->minerfund_txnlen = address_to_txn(gbt->minerfund_txn, minerfund_addr, script, /*segwit=*/false, /*cashaddr=*/true);
+		}
+
+		yyjson_val *stakingrewards;
+		const char *stakingrewards_script_hex;
+		uint64_t stakingrewards_amount;
+
+		stakingrewards = yyjson_obj_get(coinbasetxn, "stakingrewards");
+		stakingrewards_script_hex = yyjson_get_str(yyjson_obj_get(yyjson_obj_get(stakingrewards, "payoutscript"), "hex"));
+		// Remain 0 if staking rewards is disabled
+		gbt->stakingrewards_amount = 0;
+		if (stakingrewards_script_hex) {
+			gbt->stakingrewards_amount = yyjson_get_int(yyjson_obj_get(stakingrewards, "minimumvalue"));
+			gbt->stakingrewards_txnlen = strlen(stakingrewards_script_hex) / 2;
+			hex2bin(gbt->stakingrewards_txn, stakingrewards_script_hex, gbt->stakingrewards_txnlen);
+		}
+
+		rtt = yyjson_obj_get(res_val, "rtt");
+		rtt_bits_hex = yyjson_get_str(yyjson_obj_get(rtt, "nexttarget"));
+		if (rtt_bits_hex && hex2bin(rtt_bits, rtt_bits_hex, 4)) {
+			gbt->rtt_diff = diff_from_nbits(rtt_bits);
+		}
+	}
 
 	ret = true;
 out:

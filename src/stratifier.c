@@ -1,5 +1,6 @@
 /*
  * Copyright 2014-2020,2023,2025-2026 Con Kolivas
+ * Copyright 2023 The eCash developers
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -671,16 +672,28 @@ static void generate_coinbase(workbase_t *wb)
 	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
-	// Generation value
-	g64 = wb->coinbasevalue;
+	/* 
+	 * Generation value
+	 * XEC: account for minerfund and staking rewards, if any.
+	 */
+	g64 = wb->coinbasevalue - wb->minerfund_amount - wb->stakingrewards_amount;
+	uint8_t txout_count = 1; // Single byte varint is enough
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		double dbl64 = (double)g64 / 100 * ckpool.donation;
-
 		d64 = dbl64;
 		g64 -= d64; // To guarantee integers add up to the original coinbasevalue
-		wb->coinb2bin[wb->coinb2len++] = 2 + wb->insert_witness;
-	} else
-		wb->coinb2bin[wb->coinb2len++] = 1 + wb->insert_witness;
+		++txout_count;
+	}
+
+	/* XEC only: account for miner fund and staking rewards outputs */
+	if (wb->minerfund_amount > 0) {
+		++txout_count;
+	}
+	if (wb->stakingrewards_amount > 0) {
+		++txout_count;
+	}
+	
+	wb->coinb2bin[wb->coinb2len++] = txout_count + wb->insert_witness;
 
 	u64 = htole64(g64);
 	memcpy(&wb->coinb2bin[wb->coinb2len], &u64, sizeof(uint64_t));
@@ -689,7 +702,7 @@ static void generate_coinbase(workbase_t *wb)
 	/* Coinb2 address goes here, takes up 23~25 bytes + 1 byte for length */
 
 	wb->coinb3len = 0;
-	wb->coinb3bin = ckzalloc(256 + wb->insert_witness * (8 + witnessdata_size + 2));
+	wb->coinb3bin = ckzalloc(512 + wb->insert_witness * (8 + witnessdata_size + 2));
 
 	if (ckpool.donvalid && ckpool.donation > 0) {
 		u64 = htole64(d64);
@@ -701,6 +714,27 @@ static void generate_coinbase(workbase_t *wb)
 		wb->coinb3len += sdata->dontxnlen;
 	} else
 		ckpool.donation = 0;
+
+	/* XEC only: add the miner fund output */
+	if (wb->minerfund_amount > 0) {
+		u64 = (uint64_t *)(wb->coinb3bin + wb->coinb3len);
+		*u64 = htole64(wb->minerfund_amount);
+		wb->coinb3len += 8;
+
+		wb->coinb3bin[wb->coinb3len++] = wb->minerfund_txnlen;
+		memcpy(wb->coinb3bin + wb->coinb3len, wb->minerfund_txn, wb->minerfund_txnlen);
+		wb->coinb3len += wb->minerfund_txnlen;
+	}
+	/* XEC only: add the staking rewards output */
+	if (wb->stakingrewards_amount > 0) {
+		u64 = (uint64_t *)(wb->coinb3bin + wb->coinb3len);
+		*u64 = htole64(wb->stakingrewards_amount);
+		wb->coinb3len += 8;
+
+		wb->coinb3bin[wb->coinb3len++] = wb->stakingrewards_txnlen;
+		memcpy(wb->coinb3bin + wb->coinb3len, wb->stakingrewards_txn, wb->stakingrewards_txnlen);
+		wb->coinb3len += wb->stakingrewards_txnlen;
+	}
 
 	if (wb->insert_witness) {
 		// 0 value
@@ -1125,7 +1159,13 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 	 * value. Share validation and block-solve checks always use
 	 * wb->network_diff / current_workbase->network_diff on the client's
 	 * bound sdata, so mixed-network proxies remain correct. */
-	wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+
+	// XEC only.
+	if (ckpool.ecash) {
+		wb->network_diff = wb->rtt_diff;
+	} else {
+		wb->network_diff = diff_from_nbits(wb->headerbin + 72);
+	}
 	if (wb->network_diff < 1)
 		wb->network_diff = 1;
 	stats->network_diff = wb->network_diff;
@@ -1153,6 +1193,7 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 			LOGWARNING("Network diff set to %.1f", wb->network_diff);
 	}
 	len = strlen(ckpool.logdir) + 8 + 1 + 16 + 1;
+
 	wb->logdir = ckzalloc(len);
 
 	/* In proxy mode, the wb->id is received in the notify update and
@@ -2402,6 +2443,14 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 	uchar swap256[32];
 
 	free(gbt_block);
+
+	// On eCash we don't want to force mining on top of the block if it is
+	// rejected because it will conflict with avalanche and we might end up
+	// mining the wrong chain.
+	if (ckpool.ecash) {
+		return ret;
+	}
+
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
 	generator_preciousblock(rhash);
@@ -6226,7 +6275,7 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckp->ecash);
 		}
 	}
 	if (new_user) {
@@ -8539,7 +8588,7 @@ static user_instance_t *generate_remote_user(const char *workername)
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit);
+			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckp->ecash);
 		}
 	}
 	if (new_user) {
@@ -10581,24 +10630,23 @@ void *stratifier(void *arg)
 
 		/* Store this for use elsewhere */
 		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit);
+		sdata->txnlen = address_to_txn(sdata->txnbin, ckp->btcaddress, ckp->script, ckp->segwit, ckp->ecash);
 
 		/* Find a valid donation address if possible */
-		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		if (generator_checkaddr(ckp, ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
-			LOGNOTICE("BTC donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
+			LOGNOTICE("Donation address valid %s", ckpool.donaddress);
+		} else if (generator_checkaddr(ckp, ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
-			LOGNOTICE("BTC testnet donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
+			LOGNOTICE("Testnet donation address valid %s", ckpool.donaddress);
+		} else if (generator_checkaddr(ckp, ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.rtdonaddress;
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit);
-			LOGNOTICE("BTC regtest donation address valid %s", ckpool.donaddress);
-			ckpool.regtest = true;
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
+			LOGNOTICE("Regtest donation address valid %s", ckpool.donaddress);
 		} else
 			LOGNOTICE("No valid donation address found");
 	}

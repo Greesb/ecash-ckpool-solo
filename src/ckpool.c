@@ -1899,6 +1899,7 @@ static struct option long_options[] = {
 	{"testconfig",	no_argument,		0,	'T'},
 	{"trusted",	no_argument,		0,	't'},
 	{"userproxy",	no_argument,		0,	'u'},
+	{"ecash",	no_argument,	0,	'x'},
 	{0, 0, 0, 0}
 };
 
@@ -2109,7 +2110,7 @@ int main(int argc, char **argv)
 	if (!strcmp(appname, "ckproxy"))
 		ckpool.proxy = true;
 
-	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRS:s:Ttu", long_options, &i)) != -1) {
+	while ((c = getopt_long(argc, argv, "Bc:Dd:g:HhkLl:Nn:PpqRS:s:Ttux", long_options, &i)) != -1) {
 		switch (c) {
 			case 'B':
 				if (ckpool.proxy)
@@ -2203,6 +2204,9 @@ int main(int argc, char **argv)
 					quit(1, "Cannot set both userproxy and another proxy type or redirector");
 				ckpool.userproxy = ckpool.proxy = true;
 				break;
+			case 'x':
+				ckpool.ecash = true;
+				break;
 		}
 	}
 
@@ -2271,10 +2275,18 @@ int main(int argc, char **argv)
 
 	ckpool.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
 
-	/* Donations on testnet are meaningless but required for complete
-	 * testing. Testnet and regtest addresses */
-	ckpool.tndonaddress = "tb1qdxclx2qxdh0g67j27v6y6ls0xm9cl2w2xktjq2";
-	ckpool.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
+	if (ckpool.ecash) {
+		ckpool.donaddress = "ecash:prfhcnyqnl5cgrnmlfmms675w93ld7mvvqd0y8lz07";
+		ckpool.tndonaddress = "ectest:prfhcnyqnl5cgrnmlfmms675w93ld7mvvqty68c0v0";
+		ckpool.rtdonaddress = "ecregtest:qr6vhekxhvag2dwfvvtfcg5k85azpemgdypthytrsu";
+	} else {
+		ckpool.donaddress = "bc1q28kkr5hk4gnqe3evma6runjrd2pvqyp8fpwfzu";
+
+		/* Donations on testnet are meaningless but required for complete
+		* testing. Testnet and regtest addresses */
+		ckpool.tndonaddress = "tb1q5fyv7tue73y4zxezh2c685qpwx0cfngfxlrgxh";
+		ckpool.rtdonaddress = "bcrt1qlk935ze2fsu86zjp395uvtegztrkaezawxx0wf";
+	}
 
 	if (!ckpool.btcaddress && !ckpool.btcsolo && !ckpool.proxy)
 		quit(0, "Non solo mining must have a btcaddress in config, aborting!");
