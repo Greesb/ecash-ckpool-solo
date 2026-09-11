@@ -2107,7 +2107,7 @@ static uint16_t build_allocate_outputs(uint8_t *out, size_t outsz,
 	if (!addr)
 		return 0; /* empty outputs — JDC may still declare */
 
-	script_len = address_to_txn(script, addr, script_flag, segwit);
+	script_len = address_to_txn(script, addr, script_flag, segwit, ckpool.ecash);
 	if (script_len < 1 || script_len > 40) {
 		if (why)
 			*why = "identity has no usable output script";

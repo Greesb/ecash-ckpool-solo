@@ -717,8 +717,8 @@ static void generate_coinbase(workbase_t *wb)
 
 	/* XEC only: add the miner fund output */
 	if (wb->minerfund_amount > 0) {
-		u64 = (uint64_t *)(wb->coinb3bin + wb->coinb3len);
-		*u64 = htole64(wb->minerfund_amount);
+		u64 = (uint64_t)(wb->coinb3bin + wb->coinb3len);
+		u64 = htole64(wb->minerfund_amount);
 		wb->coinb3len += 8;
 
 		wb->coinb3bin[wb->coinb3len++] = wb->minerfund_txnlen;
@@ -727,8 +727,8 @@ static void generate_coinbase(workbase_t *wb)
 	}
 	/* XEC only: add the staking rewards output */
 	if (wb->stakingrewards_amount > 0) {
-		u64 = (uint64_t *)(wb->coinb3bin + wb->coinb3len);
-		*u64 = htole64(wb->stakingrewards_amount);
+		u64 = (uint64_t)(wb->coinb3bin + wb->coinb3len);
+		u64 = htole64(wb->stakingrewards_amount);
 		wb->coinb3len += 8;
 
 		wb->coinb3bin[wb->coinb3len++] = wb->stakingrewards_txnlen;
@@ -6275,7 +6275,7 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckp->ecash);
+			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckpool.ecash);
 		}
 	}
 	if (new_user) {
@@ -8588,7 +8588,7 @@ static user_instance_t *generate_remote_user(const char *workername)
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckp->ecash);
+			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckpool.ecash);
 		}
 	}
 	if (new_user) {
@@ -10630,19 +10630,19 @@ void *stratifier(void *arg)
 
 		/* Store this for use elsewhere */
 		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-		sdata->txnlen = address_to_txn(sdata->txnbin, ckp->btcaddress, ckp->script, ckp->segwit, ckp->ecash);
+		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit, ckpool.ecash);
 
 		/* Find a valid donation address if possible */
-		if (generator_checkaddr(ckp, ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
 			LOGNOTICE("Donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckp, ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
 			LOGNOTICE("Testnet donation address valid %s", ckpool.donaddress);
-		} else if (generator_checkaddr(ckp, ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
+		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.rtdonaddress;
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
