@@ -641,7 +641,7 @@ int coinbase_payout_script(uchar *script, int *slen, int64_t *value, const uchar
 			   const int cb2len);
 /**
  * @brief Decode a cash address. Only 20 bytes hashes are supported.
- * 
+ *
  * @param[in] addr The full address string
  * @param[out] prefix The prefix string. Should be allocated with at least
  *                    prefix_len bytes.

@@ -481,7 +481,7 @@ bool extract_sockaddr(char *url, char **sockaddr_url, char **sockaddr_port)
 		url_len -= 2;
 		url_begin++;
 	}
-	
+
 	if (url_len < 1) {
 		LOGWARNING("Null length URL passed to extract_sockaddr");
 		return false;
@@ -1987,7 +1987,7 @@ bool decode_cashaddr(const char *addr, char *prefix, int prefix_len, bool *scrip
 				LOGERR("Cash address prefix is too long: %s:%s", default_prefix, addr);
 				continue;
 			}
-			
+
 			strncpy(prefix, default_prefix, prefix_len);
 		}
 

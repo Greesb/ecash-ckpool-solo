@@ -672,7 +672,7 @@ static void generate_coinbase(workbase_t *wb)
 	memcpy(wb->coinb2bin + wb->coinb2len, "\xff\xff\xff\xfe", 4);
 	wb->coinb2len += 4;
 
-	/* 
+	/*
 	 * Generation value
 	 * XEC: account for minerfund and staking rewards, if any.
 	 */
@@ -692,7 +692,7 @@ static void generate_coinbase(workbase_t *wb)
 	if (wb->stakingrewards_amount > 0) {
 		++txout_count;
 	}
-	
+
 	wb->coinb2bin[wb->coinb2len++] = txout_count + wb->insert_witness;
 
 	u64 = htole64(g64);
