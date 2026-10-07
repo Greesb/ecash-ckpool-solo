@@ -546,7 +546,7 @@ static void stratifier_drop_id(const int64_t id)
 
 /* Complete the side effects after __drop_client has atomically invalidated and
  * unhashed a client under cdata->lock. Client must hold a reference count. */
-static int finish_drop_client(cdata_t *cdata, client_instance_t *client, int fd)
+static int finish_drop_client(client_instance_t *client, int fd)
 {
 	bool passthrough = client->passthrough, remote = client->remote;
 	char address_name[INET6_ADDRSTRLEN];
@@ -597,7 +597,7 @@ static int finish_invalidate_client(cdata_t *cdata, client_instance_t *client,
 {
 	client_instance_t *dead, *tmp;
 
-	ret = finish_drop_client(cdata, client, ret);
+	ret = finish_drop_client(client, ret);
 	if ((!ckpool.passthrough || ckpool.node) && !client->passthrough)
 		stratifier_drop_client(client);
 	if (ckpool.passthrough)
@@ -1339,6 +1339,9 @@ static void *receiver(void *arg)
 		if (now_t != last_reap) {
 			last_reap = now_t;
 			reap_idle_clients(cdata);
+#ifdef HAVE_SV2
+			sv2_strat_flush_aged_shares();
+#endif
 			if (ckpool.redirector)
 				expire_redirector_shares(cdata);
 		}

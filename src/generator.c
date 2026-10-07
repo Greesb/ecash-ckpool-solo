@@ -61,6 +61,7 @@ struct notify_instance {
 	 * is rotated by the receive thread under no lock at all. A share arrives
 	 * on a different thread, so it must not chase ring memory.
 	 */
+	double sv2_diff;	/* upstream difficulty of this specific job */
 	bool sv2_custom;
 	struct sv2_jdc_template *sv2_tmpl;	/* reference held */
 	/* Declared-form coinbase either side of the extranonce hole, for a local
@@ -1024,6 +1025,14 @@ out:
 	return ret;
 }
 
+uint32_t generator_get_block_mintime(const char *hash)
+{
+	gdata_t *gdata = ckpool.gdata;
+	server_instance_t *si = gdata ? gdata->current_si : NULL;
+
+	return si ? get_block_mintime(&si->cs, hash) : 0;
+}
+
 char *generator_get_txn(const char *hash)
 {
 	gdata_t *gdata = ckpool.gdata;
@@ -1692,6 +1701,10 @@ static void send_notify(proxy_instance_t *proxi, notify_instance_t *ni)
 			     "merklehash", merkle_arr, "bbversion", ni->bbversion,
 			     "nbit", ni->nbit, "ntime", ni->ntime,
 			     "clean", ni->clean);
+#ifdef HAVE_SV2
+	if (ni->sv2_diff > 0)
+		yyjson_mut_obj_add_real(doc, root, "sv2_job_diff", ni->sv2_diff);
+#endif
 	yyjson_mut_doc_set_root(doc, root);
 
 	msg = yyjson_mut_write(doc, 0, NULL);
@@ -2492,6 +2505,7 @@ static void proxy_backoff(proxy_instance_t *proxy)
 /* One recent upstream job (extended). Kept so SetNewPrevHash can activate a
  * future job and so share submits can map our notify id back to job_id. */
 struct sv2_proxy_job {
+	double diff;
 	bool valid;
 	bool future;			/* min_ntime absent: awaiting SetNewPrevHash */
 	uint32_t job_id;		/* upstream U32 job id */
@@ -2523,7 +2537,11 @@ struct sv2_proxy_job {
 	uint16_t dcb_prefix_len, dcb_suffix_len;
 };
 
-/* A submitted share awaiting SubmitShares.Success/.Error, keyed by sequence. */
+/* Errors may follow success batches for higher sequences. Keep a bounded
+ * history for their individual difficulty; successes account explicit totals. */
+#define SV2_PROXY_MAX_UNANSWERED 4096
+#define SV2_PROXY_SHARE_HISTORY 65536
+#define SV2_PROXY_ACK_TIMEOUT 120
 struct sv2_pending_share {
 	uint32_t seq;
 	double diff;
@@ -2532,13 +2550,16 @@ struct sv2_pending_share {
 };
 
 struct sv2_proxy {
+	double target_diff;	/* target for future jobs, not active work */
 	sv2_noise_session_t *noise;
 	uint32_t channel_id;
 	bool channel_open;
 	uint32_t next_request_id;
 	uint32_t next_seq;		/* SubmitSharesExtended sequence */
 	mutex_t send_lock;		/* serialises outbound Noise encrypt + pending map */
-	struct sv2_pending_share *pending;	/* shares submitted, awaiting ack */
+	struct sv2_pending_share *pending; /* recent submissions, including batched successes */
+	uint32_t unanswered;
+	time_t last_share_response;
 
 	uint8_t extranonce_prefix[SV2_MAX_B0_32];	/* pool-assigned, into coinb1 */
 	uint8_t extranonce_prefix_len;
@@ -2600,6 +2621,77 @@ struct sv2_proxy {
 	uint8_t *rx;
 	size_t rx_len, rx_cap;
 };
+
+/* send_lock held for all ledger operations. Aggregate success counts cannot
+ * identify each accepted sequence: last_sequence_number is not a cumulative ACK. */
+static void sv2_proxy_clear_shares(struct sv2_proxy *sp)
+{
+	struct sv2_pending_share *ps, *tmp;
+
+	HASH_ITER(hh, sp->pending, ps, tmp) {
+		HASH_DEL(sp->pending, ps);
+		free(ps);
+	}
+}
+
+static bool sv2_proxy_track_share(struct sv2_proxy *sp, uint32_t seq, double diff,
+				  int64_t client_id, time_t now)
+{
+	struct sv2_pending_share *ps;
+
+	if (sp->unanswered >= SV2_PROXY_MAX_UNANSWERED ||
+	    (sp->unanswered && now - sp->last_share_response >= SV2_PROXY_ACK_TIMEOUT))
+		return false;
+	HASH_FIND(hh, sp->pending, &seq, sizeof(seq), ps);
+	if (ps)
+		return false;
+	if (HASH_COUNT(sp->pending) >= SV2_PROXY_SHARE_HISTORY) {
+		/* This is only rejection lookup history, not creditable work. A
+		 * response older than the history forces a reconnect below. */
+		ps = sp->pending;
+		HASH_DEL(sp->pending, ps);
+		free(ps);
+	}
+	ps = ckzalloc(sizeof(*ps));
+	ps->seq = seq;
+	ps->diff = diff;
+	ps->client_id = client_id;
+	HASH_ADD(hh, sp->pending, seq, sizeof(seq), ps);
+	if (!sp->unanswered++)
+		sp->last_share_response = now;
+	return true;
+}
+
+static bool sv2_proxy_accept_batch(struct sv2_proxy *sp,
+				   const struct sv2_submit_shares_success *ok, time_t now)
+{
+	if (ok->channel_id != sp->channel_id || !ok->new_submits_accepted_count ||
+	    ok->new_submits_accepted_count > sp->unanswered)
+		return false;
+	sp->unanswered -= ok->new_submits_accepted_count;
+	sp->last_share_response = now;
+	if (!sp->unanswered)
+		sv2_proxy_clear_shares(sp);
+	return true;
+}
+
+static bool sv2_proxy_reject_share(struct sv2_proxy *sp, uint32_t seq,
+				   double *diff, time_t now)
+{
+	struct sv2_pending_share *ps;
+
+	HASH_FIND(hh, sp->pending, &seq, sizeof(seq), ps);
+	if (!ps || !sp->unanswered)
+		return false;
+	*diff = ps->diff;
+	HASH_DEL(sp->pending, ps);
+	free(ps);
+	sp->unanswered--;
+	sp->last_share_response = now;
+	if (!sp->unanswered)
+		sv2_proxy_clear_shares(sp);
+	return true;
+}
 
 /* Release everything a job slot owns, leaving it zeroed. */
 static void sv2_proxy_job_clear(struct sv2_proxy_job *job)
@@ -2826,6 +2918,10 @@ static bool sv2_proxy_setup(proxy_instance_t *proxi, connsock_t *cs)
 			dealloc(f);
 			return false;
 		}
+		if (fr.extension_type & SV2_EXTENSION_MASK) {
+			dealloc(f);
+			continue;
+		}
 		pay = f + SV2_FRAME_HEADER_LEN;
 		if (fr.msg_type == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
 			struct sv2_setup_connection_success ok;
@@ -2908,6 +3004,10 @@ static bool sv2_proxy_open(proxy_instance_t *proxi, connsock_t *cs)
 		if (!sv2_decode_header(f, fl, &fr)) {
 			dealloc(f);
 			return false;
+		}
+		if (fr.extension_type & SV2_EXTENSION_MASK) {
+			dealloc(f);
+			continue;
 		}
 		pay = f + SV2_FRAME_HEADER_LEN;
 		if (fr.msg_type == SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS) {
@@ -3022,6 +3122,7 @@ static bool sv2_proxy_open(proxy_instance_t *proxi, connsock_t *cs)
 			proxi->diff = diff_from_target(ok.target);
 			if (proxi->diff < 1)
 				proxi->diff = 1;
+			sp->target_diff = proxi->diff;
 			LOGNOTICE("SV2 proxy %d channel %u diff=%.1f",
 				  proxi->id, sp->channel_id, proxi->diff);
 			return true;
@@ -3256,13 +3357,36 @@ out:
 
 static struct sv2_proxy_job *sv2_proxy_job_slot(struct sv2_proxy *sp, uint32_t job_id)
 {
-	struct sv2_proxy_job *job = &sp->jobs[sp->job_head];
+	struct sv2_proxy_job *job = NULL;
+	int i;
 
-	sp->job_head = (sp->job_head + 1) % SV2_PROXY_JOBS;
+	/* IDs may be reused after invalidation. Never leave an older same-ID
+	 * slot ahead of the replacement in lookup order. */
+	for (i = 0; i < SV2_PROXY_JOBS; i++) {
+		if (sp->jobs[i].valid && sp->jobs[i].job_id == job_id) {
+			job = &sp->jobs[i];
+			break;
+		}
+	}
+	if (!job) {
+		job = &sp->jobs[sp->job_head];
+		sp->job_head = (sp->job_head + 1) % SV2_PROXY_JOBS;
+	}
 	sv2_proxy_job_clear(job);
 	job->job_id = job_id;
 	job->valid = true;
 	return job;
+}
+
+/* SetNewPrevHash invalidates every other queued job, even on the same tip. */
+static void sv2_proxy_invalidate_jobs(struct sv2_proxy *sp, struct sv2_proxy_job *keep)
+{
+	int i;
+
+	for (i = 0; i < SV2_PROXY_JOBS; i++) {
+		if (&sp->jobs[i] != keep)
+			sv2_proxy_job_clear(&sp->jobs[i]);
+	}
 }
 
 static struct sv2_proxy_job *sv2_proxy_find_job(struct sv2_proxy *sp, uint32_t job_id)
@@ -3314,6 +3438,17 @@ static void sv2_proxy_work_src(proxy_instance_t *proxi, enum sv2_work_src src,
 	}
 }
 
+/* Freeze the target when future work becomes active. Re-emitting an active
+ * job (for example after SetExtranoncePrefix) must not retarget it. */
+static void sv2_proxy_activate_job(struct sv2_proxy *sp, struct sv2_proxy_job *job)
+{
+	if (!job->future)
+		return;
+	job->diff = sp->target_diff;
+	job->min_ntime = sp->snph_min_ntime;
+	job->future = false;
+}
+
 /* Translate a stored SV2 job + current prevhash context into an SV1-shaped
  * notify_instance and hand it to the stratifier via send_notify. clean=true on
  * a real tip change (SetNewPrevHash), false for a same-tip immediate job. */
@@ -3351,6 +3486,9 @@ static void sv2_proxy_send_job(proxy_instance_t *proxi, struct sv2_proxy_job *jo
 	ni->jobid = yyjson_mut_doc_new(&ckyyalc);
 	yyjson_mut_doc_set_root(ni->jobid, yyjson_mut_uint(ni->jobid, job->job_id));
 
+	sv2_proxy_activate_job(sp, job);
+	ni->sv2_diff = job->diff;
+	proxi->diff = job->diff;
 	ni->coinb1len = job->coinb1len;
 	ni->coinbase1 = ckalloc(job->coinb1len * 2 + 1);
 	__bin2hex(ni->coinbase1, job->coinb1, job->coinb1len);
@@ -3544,13 +3682,13 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	gdata_t *gdata = ckpool.gdata;
 	notify_instance_t *ni;
 	struct sv2_submit_shares_extended sub;
-	struct sv2_pending_share *ps;
 	const char *nonce2, *ntime_s, *nonce_s;
 	uint32_t version_mask = 0, base_version = 0, upstream_job = 0, seq;
 	uint8_t full_en[SV2_MAX_B0_32];
 	uint8_t nonce2bin[32];
 	uint8_t full_len = 0, ep[SV2_MAX_B0_32], eplen = 0;
 	bool custom = false;
+	double job_diff = 0;
 	int64_t jobid = 0;
 	uint8_t pbuf[128];
 	size_t plen = 0;
@@ -3575,6 +3713,7 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	if (ni) {
 		upstream_job = (uint32_t)yyjson_mut_get_uint(yyjson_mut_doc_get_root(ni->jobid));
 		sscanf(ni->bbversion, "%x", &base_version);
+		job_diff = ni->sv2_diff;
 		custom = ni->sv2_custom;
 		eplen = ni->sv2_en_prefix_len;
 		memcpy(ep, ni->sv2_en_prefix, eplen);
@@ -3633,19 +3772,26 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 
 	if (!sv2_encode_submit_shares_extended(pbuf, sizeof(pbuf), &plen, &sub))
 		return;
+	/* Publish before sending: the receive thread can acknowledge immediately. */
+	mutex_lock(&sp->send_lock);
+	if (!sv2_proxy_track_share(sp, seq, job_diff, client_id, time(NULL))) {
+		mutex_unlock(&sp->send_lock);
+		LOGWARNING("SV2 proxy %d share response limit reached, reconnecting", proxi->id);
+		shutdown(proxi->cs.fd, SHUT_RDWR);
+		return;
+	}
+	mutex_unlock(&sp->send_lock);
 	if (!sv2_proxy_send(proxi, &proxi->cs, SV2_MSG_SUBMIT_SHARES_EXTENDED, true,
 			    pbuf, plen)) {
+		double ignored;
+
+		mutex_lock(&sp->send_lock);
+		sv2_proxy_reject_share(sp, seq, &ignored, time(NULL));
+		mutex_unlock(&sp->send_lock);
+		shutdown(proxi->cs.fd, SHUT_RDWR);
 		LOGNOTICE("SV2 proxy %d failed to send share seq %u", proxi->id, seq);
 		return;
 	}
-	/* Track for accounting when the batched Success / Error arrives. */
-	ps = ckzalloc(sizeof(*ps));
-	ps->seq = seq;
-	ps->diff = proxi->diff;
-	ps->client_id = client_id;
-	mutex_lock(&sp->send_lock);
-	HASH_ADD(hh, sp->pending, seq, sizeof(uint32_t), ps);
-	mutex_unlock(&sp->send_lock);
 	LOGINFO("SV2 proxy %d submitted share seq %u job %u ver %08x", proxi->id,
 		seq, upstream_job, sub.base.version);
 
@@ -3694,6 +3840,7 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 			break;
 		}
 		job = sv2_proxy_job_slot(sp, j.job_id);
+		job->diff = sp->target_diff;
 		job->future = !j.min_ntime_present;
 		job->min_ntime = j.min_ntime;
 		job->version = j.version;
@@ -3743,15 +3890,14 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		struct sv2_proxy_job *job;
 		const char *implausible = NULL;
 		enum sv2_tip_rel rel;
-		bool custom_tip;
 
 		if (!sv2_decode_set_new_prev_hash(pay, pl, &p))
 			break;
 		/* Spec: unknown job_id is a protocol error — fail closed without
 		 * mutating tip (avoids silent non-clean work on a new tip). */
 		job = sv2_proxy_find_job(sp, p.job_id);
-		if (!job) {
-			LOGWARNING("SV2 proxy %d SetNewPrevHash job %u not found — reconnecting",
+		if (!job || !job->future) {
+			LOGWARNING("SV2 proxy %d SetNewPrevHash job %u is not a queued future job — reconnecting",
 				   proxi->id, p.job_id);
 			sp->want_reconnect = true;
 			break;
@@ -3760,14 +3906,11 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		sp->nbits = p.nbits;
 		sp->snph_min_ntime = p.min_ntime;
 		sp->have_prevhash = true;
-		/*
-		 * ckpool's JDS drops a channel's custom jobs as soon as its own tip
-		 * moves (channel_clear_custom_locked), so custom work only outlives
-		 * a SetNewPrevHash that repeats the tip it was declared on.
-		 */
-		custom_tip = sp->have_custom_prev &&
-			     !memcmp(sp->custom_prev, p.prev_hash, 32);
-		sp->have_custom_prev = custom_tip;
+		sv2_proxy_invalidate_jobs(sp, job);
+		if (sp->have_custom_prev) {
+			sp->have_custom_prev = false;
+			sv2_jdc_custom_dropped("SetNewPrevHash invalidated custom work");
+		}
 		/*
 		 * Where the pool's tip sits relative to our own chain is what the
 		 * whole arbiter turns on, and only the JD client knows: it owns the
@@ -3780,16 +3923,6 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 					 &implausible);
 		LOGNOTICE("SV2 proxy %d new prevhash for job %u nbits=0x%08x (%s)",
 			  proxi->id, p.job_id, p.nbits, sv2_tip_rel_str(rel));
-		if (custom_tip) {
-			/*
-			 * The pool has repeated the tip our custom work is on. It is
-			 * not a work change, and handing miners pool work for it
-			 * would cost them the declared job for nothing.
-			 */
-			LOGINFO("SV2 proxy %d not notifying pool job %u: custom work is "
-				"live on this tip", proxi->id, p.job_id);
-			break;
-		}
 		switch (rel) {
 			case SV2_TIP_AHEAD:
 				/*
@@ -3829,9 +3962,8 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 						   "no local template to declare");
 				break;
 		}
-		/* Activate the referenced job, flushing only a tip miners are not
-		 * already working on. */
-		sv2_proxy_send_job(proxi, job, sv2_proxy_want_clean(sp, p.prev_hash));
+		/* All previous jobs are invalid, including same-tip work. */
+		sv2_proxy_send_job(proxi, job, true);
 		break;
 	}
 	case SV2_MSG_SET_CUSTOM_MINING_JOB_SUCCESS: {
@@ -3867,6 +3999,7 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		/* Custom and pool job ids come from one server-side counter, so
 		 * they share the ring without colliding. */
 		job = sv2_proxy_job_slot(sp, ok.job_id);
+		stage.diff = sp->target_diff;
 		stage.job_id = ok.job_id;
 		stage.valid = true;
 		*job = stage;
@@ -3913,9 +4046,8 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 		diff = diff_from_target(t.maximum_target);
 		if (diff < 1)
 			diff = 1;
-		proxi->diff = diff;
+		sp->target_diff = diff;
 		LOGNOTICE("SV2 proxy %d SetTarget diff %.1f", proxi->id, diff);
-		send_diff(proxi);
 		break;
 	}
 	case SV2_MSG_SET_EXTRANONCE_PREFIX: {
@@ -4000,57 +4132,39 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 	}
 	case SV2_MSG_SUBMIT_SHARES_SUCCESS: {
 		struct sv2_submit_shares_success ok;
-		struct sv2_pending_share *ps, *tmp;
-		double *credit = NULL;
-		int credited = 0, i;
+		bool valid;
 
 		if (!sv2_decode_submit_shares_success(pay, pl, &ok))
 			break;
-		/* Unlink every pending share up to last_sequence_number (batched
-		 * ack; signed diff handles sequence wraparound), then account for
-		 * them *after* dropping send_lock: account_shares takes proxy_lock
-		 * and proxystats takes proxy_lock before send_lock, so crediting
-		 * under send_lock would invert the lock order and deadlock. */
 		mutex_lock(&sp->send_lock);
-		HASH_ITER(hh, sp->pending, ps, tmp) {
-			if ((int32_t)(ok.last_sequence_number - ps->seq) >= 0) {
-				credit = ckrealloc(credit, (credited + 1) * sizeof(double));
-				credit[credited++] = ps->diff;
-				HASH_DEL(sp->pending, ps);
-				dealloc(ps);
-			}
-		}
+		valid = sv2_proxy_accept_batch(sp, &ok, time(NULL));
 		mutex_unlock(&sp->send_lock);
-		for (i = 0; i < credited; i++)
-			account_shares(proxi, credit[i], true);
-		dealloc(credit);
-		LOGINFO("SV2 proxy %d SubmitShares.Success last_seq=%u accepted=%u credited=%d",
+		if (!valid) {
+			sp->want_reconnect = true;
+			break;
+		}
+		/* Account outside send_lock: account_shares takes proxy_lock. */
+		account_shares(proxi, (double)ok.new_shares_sum, true);
+		LOGINFO("SV2 proxy %d SubmitShares.Success last_seq=%u accepted=%u sum=%"PRIu64,
 			proxi->id, ok.last_sequence_number, ok.new_submits_accepted_count,
-			credited);
+			ok.new_shares_sum);
 		break;
 	}
 	case SV2_MSG_SUBMIT_SHARES_ERROR: {
 		struct sv2_submit_shares_error err;
-		struct sv2_pending_share *ps;
 		double diff = 0;
-		bool found = false;
-		uint32_t seq;
+		bool found;
 
 		if (!sv2_decode_submit_shares_error(pay, pl, &err))
 			break;
-		seq = err.sequence_number;
-		/* As above: unlink under send_lock, account after releasing it. */
 		mutex_lock(&sp->send_lock);
-		HASH_FIND(hh, sp->pending, &seq, sizeof(uint32_t), ps);
-		if (ps) {
-			diff = ps->diff;
-			found = true;
-			HASH_DEL(sp->pending, ps);
-			dealloc(ps);
-		}
+		found = err.channel_id == sp->channel_id &&
+			sv2_proxy_reject_share(sp, err.sequence_number, &diff, time(NULL));
 		mutex_unlock(&sp->send_lock);
 		if (found)
 			account_shares(proxi, diff, false);
+		else
+			sp->want_reconnect = true;
 		LOGNOTICE("SV2 proxy %d SubmitShares.Error seq=%u: %s",
 			  proxi->id, err.sequence_number, err.error_code);
 		break;
@@ -4110,6 +4224,10 @@ static bool sv2_proxy_service(proxy_instance_t *proxi, connsock_t *cs)
 		break;
 	}
 
+	mutex_lock(&sp->send_lock);
+	if (sp->unanswered && time(NULL) - sp->last_share_response >= SV2_PROXY_ACK_TIMEOUT)
+		sp->want_reconnect = true;
+	mutex_unlock(&sp->send_lock);
 	/* A Reconnect frame asks us to drop and re-handshake. */
 	if (sp->want_reconnect)
 		return false;
@@ -5242,7 +5360,7 @@ static yyjson_mut_val *__proxystats(yyjson_mut_doc *doc, proxy_instance_t *proxy
 		int pending;
 
 		mutex_lock(&sp->send_lock);
-		pending = HASH_COUNT(sp->pending);
+		pending = sp->unanswered;
 		mutex_unlock(&sp->send_lock);
 		yyjson_mut_obj_add_int(doc, val, "sv2_channel", sp->channel_id);
 		yyjson_mut_obj_add_int(doc, val, "sv2_extranonce_size", sp->extranonce_size);

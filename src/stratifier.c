@@ -34,6 +34,7 @@
 #include "bitcoin.h"
 #include "sha2.h"
 #include "stratifier.h"
+#include "stratifier_stats.h"
 #include "uthash.h"
 #include "utlist.h"
 #include "connector.h"
@@ -256,7 +257,9 @@ struct stratum_instance {
 
 	int64_t diff; /* Current diff */
 	int64_t old_diff; /* Previous diff */
+	int64_t start_diff; /* Pool-assigned initial diff, before client suggestions */
 	int64_t diff_change_job_id; /* Last job_id we changed diff */
+	double max_accepted_diff; /* Highest accepted assigned diff; pool uastats_lock */
 
 	int64_t uadiff; /* Shares not yet accounted for in hashmeter */
 
@@ -1665,6 +1668,7 @@ static void gbt_witness_data(workbase_t *wb, yyjson_val *txn_array)
  * so the caller can fall back to GBT. */
 static workbase_t *build_ipc_workbase(void)
 {
+	sdata_t *sdata = ckpool.sdata;
 	unsigned char branch[MINING_MAX_MERKLES][32];
 	unsigned char header[80], rev[32], swap[32];
 	mining_block_template *tmpl = NULL;
@@ -1705,6 +1709,20 @@ static workbase_t *build_ipc_workbase(void)
 		rev[i] = header[4 + 31 - i];
 	swap_256(swap, rev);
 	__bin2hex(wb->prevhash, swap, 32);
+
+	/* IPC does not expose MTP. Cache the parent's RPC result on its workbase
+	 * instead of making node calls on the connector's receive thread. */
+	ck_rlock(&sdata->workbase_lock);
+	if (sdata->current_workbase &&
+	    !strcmp(sdata->current_workbase->prevhash, wb->prevhash))
+		wb->mintime = sdata->current_workbase->mintime;
+	ck_runlock(&sdata->workbase_lock);
+	if (!wb->mintime) {
+		char parent[65];
+
+		__bin2hex(parent, rev, 32);
+		wb->mintime = generator_get_block_mintime(parent);
+	}
 
 	/* Coinbase-derived fields. */
 	wb->coinbasevalue = cb.block_reward_remaining;
@@ -3588,6 +3606,8 @@ static void update_notify(const char *cmd)
 	wb->enonce1varlen = proxy->enonce1varlen;
 	wb->enonce2varlen = proxy->enonce2varlen;
 	wb->diff = proxy->diff;
+	/* SV2 targets belong to jobs; proxy state may already have advanced. */
+	yyjson_obj_get_double(&wb->diff, val, "sv2_job_diff");
 	ck_runlock(&dsdata->workbase_lock);
 
 	add_base(dsdata, wb, &new_block);
@@ -4018,6 +4038,7 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 		if (client->suggest_diff > client->diff)
 			client->diff = client->old_diff = client->suggest_diff;
 	}
+	client->start_diff = client->diff;
 	tv_time(&client->ldc);
 	/* Points to ckp sdata in ckpool mode, but is changed later in proxy
 	 * mode . */
@@ -6242,16 +6263,19 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 static user_instance_t *generate_user(stratum_instance_t *client,
 				      const char *workername)
 {
-	char *base_username = strdupa(workername), *username;
+	char *base_username, *username;
 	bool new_user = false, new_worker = false;
 	sdata_t *sdata = ckpool.sdata;
 	worker_instance_t *worker;
 	user_instance_t *user;
 	int len;
 
+	/* Callers normally validate at the protocol boundary. Keep this safe
+	 * for every caller, before strdupa/strsep can see an empty identity. */
+	if (unlikely(workername_error(workername)))
+		return NULL;
+	base_username = strdupa(workername);
 	username = strsep(&base_username, "._");
-	if (!username || !strlen(username))
-		username = base_username;
 	len = strlen(username);
 	if (unlikely(len > 127))
 		username[127] = '\0';
@@ -6357,7 +6381,7 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 			    yyjson_mut_doc **err_doc)
 {
 	user_instance_t *user;
-	const char *buf, *pass;
+	const char *buf, *pass, *name_error;
 	bool ret = false;
 	int arr_size;
 	ts_t now;
@@ -6376,20 +6400,9 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 		goto out;
 	}
 	buf = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 0));
-	if (!buf) {
-		*err_doc = yyjson_string("Invalid workername parameter");
-		goto out;
-	}
-	if (!strlen(buf)) {
-		*err_doc = yyjson_string("Empty workername parameter");
-		goto out;
-	}
-	if (!memcmp(buf, ".", 1) || !memcmp(buf, "_", 1)) {
-		*err_doc = yyjson_string("Empty username parameter");
-		goto out;
-	}
-	if (strchr(buf, '/')) {
-		*err_doc = yyjson_string("Invalid character in username");
+	name_error = workername_error(buf);
+	if (name_error) {
+		*err_doc = yyjson_string(name_error);
 		goto out;
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
@@ -6506,6 +6519,25 @@ static double time_bias(const double tdiff, const double period)
 	return 1.0 - 1.0 / exp(dexp);
 }
 
+/* Caller holds the pool uastats_lock. Bound reject accounting by the highest
+ * assigned difficulty actually met by an accepted share, not its PoW diff.
+ * Suggestions and stale work cannot raise this cap. */
+static void account_client_share(pool_stats_t *stats, stratum_instance_t *client,
+				 const double diff, const bool valid)
+{
+	if (valid) {
+		if (diff > client->max_accepted_diff)
+			client->max_accepted_diff = diff;
+		stats->unaccounted_shares++;
+		stats->unaccounted_diff_shares += diff;
+	} else {
+		double reject_diff = client->max_accepted_diff > 0 ?
+			MIN(diff, client->max_accepted_diff) : client->start_diff;
+
+		stats->unaccounted_rejects = add_reject_diff(stats->unaccounted_rejects, reject_diff);
+	}
+}
+
 /* Needs to be entered with client holding a ref count. */
 static void add_submit(stratum_instance_t *client, const double diff, const bool valid,
 		       const bool submit)
@@ -6518,11 +6550,7 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	tv_t now_t;
 
 	mutex_lock(&ckp_sdata->uastats_lock);
-	if (valid) {
-		ckp_sdata->stats.unaccounted_shares++;
-		ckp_sdata->stats.unaccounted_diff_shares += diff;
-	} else
-		ckp_sdata->stats.unaccounted_rejects += diff;
+	account_client_share(&ckp_sdata->stats, client, diff, valid);
 	mutex_unlock(&ckp_sdata->uastats_lock);
 
 	/* Count only accepted and stale rejects in diff calculation. */
@@ -7066,7 +7094,7 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 	int64_t id;
 	bool ret = false;
 
-	if (!sdata || !user_identity || !out_instance_id || enonce1_len < 1 ||
+	if (!sdata || workername_error(user_identity) || !out_instance_id || enonce1_len < 1 ||
 	    enonce1_len > 16)
 		return false;
 
@@ -7216,6 +7244,33 @@ bool stratifier_sv2_tip_for_jd(uint32_t *version_out, uint32_t *ntime_out,
 	return true;
 }
 
+bool stratifier_sv2_custom_tip(uint8_t prev[32], uint32_t *nbits,
+				uint32_t *mintime, int *height, int64_t *wb_id)
+{
+	sdata_t *sdata = ckpool.sdata;
+	workbase_t *wb;
+	uint8_t wire[80];
+	uint32_t bits;
+	bool ok = false;
+
+	if (!sdata)
+		return false;
+	ck_rlock(&sdata->workbase_lock);
+	wb = sdata->current_workbase;
+	if (wb && wb->mintime) {
+		flip_80(wire, wb->headerbin);
+		memcpy(prev, wire + 4, 32);
+		memcpy(&bits, wire + 72, 4);
+		*nbits = le32toh(bits);
+		*mintime = wb->mintime;
+		*height = wb->height;
+		*wb_id = wb->id;
+		ok = true;
+	}
+	ck_runlock(&sdata->workbase_lock);
+	return ok;
+}
+
 bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 				int64_t *wb_id_out, uint32_t *version_out,
 				uint32_t *ntime_out, uint32_t *nbits_out,
@@ -7279,7 +7334,7 @@ static void check_best_diff(sdata_t *sdata, user_instance_t *user, worker_instan
 
 bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 				 uint32_t ntime, uint32_t nonce, uint32_t version,
-				 const char *nonce2hex_in,
+				 const char *nonce2hex_in, double job_diff,
 				 char *errbuf, size_t errbufsz, double *sdiff_out)
 {
 	sdata_t *sdata = ckpool.sdata;
@@ -7367,11 +7422,8 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 		return false;
 	}
 
-	/* Accept min(new,old) until workbase advances past retarget (SV1 parity). */
-	diff = client->diff;
-	if (workbase_id && workbase_id < client->diff_change_job_id &&
-	    client->old_diff > 0)
-		diff = MIN(diff, (double)client->old_diff);
+	/* SV2 active jobs retain their advertised difficulty across retargets. */
+	diff = job_diff;
 	if (sdiff >= diff) {
 		if (new_share(sdata, hash, workbase_id)) {
 			result = true;
@@ -7431,8 +7483,23 @@ double stratifier_sv2_network_diff(void)
 	return nd;
 }
 
+/* Queued custom work keeps its own coinbase, but not permission to credit a
+ * previous tip. Same-tip template refreshes remain valid, as for pool shares. */
+static bool sv2_custom_job_current(sdata_t *sdata, int64_t workbase_id)
+{
+	bool current;
+
+	if (!sdata || workbase_id <= 0)
+		return false;
+	ck_rlock(&sdata->workbase_lock);
+	current = sdata->current_workbase && workbase_id >= sdata->blockchange_id &&
+		workbase_id <= sdata->current_workbase->id;
+	ck_runlock(&sdata->workbase_lock);
+	return current;
+}
+
 bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
-				  const unsigned char hash[32], double sdiff,
+				  const unsigned char hash[32], double sdiff, double job_diff,
 				  char *errbuf, size_t errbufsz,
 				  bool *network_diff_met)
 {
@@ -7446,6 +7513,11 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 		*network_diff_met = false;
 	if (errbuf && errbufsz)
 		errbuf[0] = '\0';
+	if (!sv2_custom_job_current(sdata, workbase_id)) {
+		if (errbuf && errbufsz)
+			snprintf(errbuf, errbufsz, "stale-share");
+		return false;
+	}
 	client = ref_instance_by_id(sdata, instance_id);
 	if (!client || !client->authorised) {
 		if (errbuf)
@@ -7463,15 +7535,7 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 			user->username, worker->workername, client->identity, sdiff);
 		check_best_diff(sdata, user, worker, sdiff, client);
 	}
-	if (!wb_id) {
-		ck_rlock(&sdata->workbase_lock);
-		if (sdata->current_workbase)
-			wb_id = sdata->current_workbase->id;
-		ck_runlock(&sdata->workbase_lock);
-	}
-	diff = client->diff;
-	if (wb_id && wb_id < client->diff_change_job_id && client->old_diff > 0)
-		diff = MIN(diff, (double)client->old_diff);
+	diff = job_diff;
 	if (sdiff >= diff) {
 		if (new_share(sdata, hash, wb_id)) {
 			result = true;
@@ -10255,7 +10319,7 @@ out_status:
 			mutex_lock(&sdata->stats_lock);
 			stats->accounted_shares += unaccounted_shares;
 			stats->accounted_diff_shares += unaccounted_diff_shares;
-			stats->accounted_rejects += unaccounted_rejects;
+			stats->accounted_rejects = add_rejects(stats->accounted_rejects, unaccounted_rejects);
 
 			decay_time(&stats->sps1, unaccounted_shares, per_tdiff, MIN1);
 			decay_time(&stats->sps5, unaccounted_shares, per_tdiff, MIN5);

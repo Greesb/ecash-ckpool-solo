@@ -35,9 +35,10 @@ static bool check_required_rule(const char* rule)
  * bitcoind to see if it's a valid address */
 bool validate_address(connsock_t *cs, const char *address, bool *script, bool *segwit)
 {
+	yyjson_mut_doc *reqdoc;
 	yyjson_doc *doc;
 	yyjson_val *root, *res_val, *valid_val, *tmp_val;
-	char rpc_req[128];
+	char *rpc_req;
 	bool ret = false;
 
 	if (unlikely(!address)) {
@@ -45,8 +46,18 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 		return ret;
 	}
 
-	snprintf(rpc_req, 128, "{\"method\": \"validateaddress\", \"params\": [\"%s\"]}\n", address);
+	/* The address can be an untrusted mining username. Escape it as one
+	 * complete JSON string: interpolation and truncation can make bitcoind
+	 * validate a different address from the one we subsequently decode. */
+	reqdoc = yyjson_mut_pack("{ss,s[s]}", "method", "validateaddress", "params", address);
+	if (unlikely(!reqdoc))
+		return false;
+	rpc_req = yyjson_mut_write(reqdoc, YYJSON_WRITE_NEWLINE_AT_END, NULL);
+	yyjson_mut_doc_free(reqdoc);
+	if (unlikely(!rpc_req))
+		return false;
 	doc = yyjson_rpc_response(cs, rpc_req);
+	dealloc(rpc_req);
 	if (!doc) {
 		/* May get a parse error with an invalid address */
 		LOGNOTICE("%s:%s Failed to get valid json response to validate_address %s",
@@ -229,6 +240,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	gbt->version = version;
 
 	gbt->curtime = curtime;
+	gbt->mintime = yyjson_get_uint(yyjson_obj_get(res_val, "mintime"));
 
 	snprintf(gbt->ntime, 9, "%08x", curtime);
 	yyjson_mut_obj_add_str(mut_doc, mut_root, "ntime", gbt->ntime);
@@ -565,4 +577,26 @@ out_free:
 	yyjson_doc_free(doc);
 out:
 	return ret;
+}
+
+/* Query a specific parent, so a concurrent tip change cannot mix contexts. */
+uint32_t get_block_mintime(connsock_t *cs, const char *hash)
+{
+	yyjson_doc *doc;
+	yyjson_val *value;
+	char request[160];
+	uint64_t mtp = 0;
+
+	if (strlen(hash) != 64 || !validhex(hash))
+		return 0;
+	snprintf(request, sizeof(request),
+		 "{\"method\":\"getblockheader\",\"params\":[\"%s\",true]}\n", hash);
+	doc = yyjson_rpc_response(cs, request);
+	if (!doc)
+		return 0;
+	value = yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(doc), "result"), "mediantime");
+	if (yyjson_is_uint(value))
+		mtp = yyjson_get_uint(value);
+	yyjson_doc_free(doc);
+	return mtp && mtp < UINT32_MAX ? (uint32_t)mtp + 1 : 0;
 }

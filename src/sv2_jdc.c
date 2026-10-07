@@ -161,6 +161,7 @@ static struct {
 	int fd;
 	sv2_noise_session_t *noise;
 	mutex_t send_lock;
+	uint64_t generation; /* send_lock and jdc_lock for writes */
 	bool ready;			/* SetupConnection.Success seen */
 	uint32_t next_request_id;
 
@@ -912,21 +913,20 @@ static int sess_readframe(uint8_t **plain, size_t *plainlen, float timeout)
 }
 
 /* Encrypt and send one plaintext JD message. Single writer via send_lock. */
-static bool sess_send(uint8_t msg_type, const uint8_t *pay, size_t paylen)
+static bool sess_send(uint64_t generation, uint8_t msg_type, const uint8_t *pay, size_t paylen)
 {
 	uint8_t *frame = NULL, *ct = NULL;
 	size_t flen = 0, ctlen = 0;
 	bool ret = false;
 
-	if (sess.fd < 0 || !sess.noise)
-		return false;
 	if (!sv2_build_frame(0, msg_type, pay, (uint32_t)paylen, &frame, &flen))
 		return false;
 	mutex_lock(&sess.send_lock);
-	if (sv2_noise_encrypt_frame(sess.noise, frame, flen, &ct, &ctlen))
+	if (sess.fd >= 0 && sess.noise && (!generation || generation == sess.generation) &&
+	    sv2_noise_encrypt_frame(sess.noise, frame, flen, &ct, &ctlen))
 		ret = (write_socket(sess.fd, ct, ctlen) == (int)ctlen);
 	if (ret)
-		sess.tx_since_rx = true;
+		__atomic_store_n(&sess.tx_since_rx, true, __ATOMIC_RELAXED);
 	mutex_unlock(&sess.send_lock);
 	dealloc(frame);
 	dealloc(ct);
@@ -937,7 +937,9 @@ static void sess_disconnect(void)
 {
 	struct jdc_material drop;
 
+	mutex_lock(&sess.send_lock);
 	mutex_lock(&jdc_lock);
+	sess.generation++;
 	sess.ready = false;
 	sess.have_token = false;
 	sess.pending.live = false;
@@ -963,6 +965,7 @@ static void sess_disconnect(void)
 		close(sess.fd);
 		sess.fd = -1;
 	}
+	mutex_unlock(&sess.send_lock);
 	dealloc(sess.rx);
 	sess.rx_len = sess.rx_cap = 0;
 }
@@ -1015,7 +1018,7 @@ static bool sess_setup(void)
 	snprintf(sc.vendor, sizeof(sc.vendor), "ckproxy");
 	snprintf(sc.firmware, sizeof(sc.firmware), "%s", PACKAGE"/"VERSION);
 	if (!sv2_encode_setup_connection(buf, sizeof(buf), &plen, &sc) ||
-	    !sess_send(SV2_MSG_SETUP_CONNECTION, buf, plen)) {
+	    !sess_send(0, SV2_MSG_SETUP_CONNECTION, buf, plen)) {
 		LOGNOTICE("JDC failed to send SetupConnection");
 		return false;
 	}
@@ -1032,6 +1035,10 @@ static bool sess_setup(void)
 		if (!sv2_decode_header(f, fl, &fr)) {
 			dealloc(f);
 			return false;
+		}
+		if (fr.extension_type & SV2_EXTENSION_MASK) {
+			dealloc(f);
+			continue;
 		}
 		pay = f + SV2_FRAME_HEADER_LEN;
 		if (fr.msg_type == SV2_MSG_SETUP_CONNECTION_SUCCESS) {
@@ -1076,7 +1083,7 @@ static void sess_allocate_token(void)
 	mutex_unlock(&jdc_lock);
 
 	if (!sv2_encode_allocate_mining_job_token(buf, sizeof(buf), &plen, &req) ||
-	    !sess_send(SV2_MSG_ALLOCATE_MINING_JOB_TOKEN, buf, plen)) {
+	    !sess_send(0, SV2_MSG_ALLOCATE_MINING_JOB_TOKEN, buf, plen)) {
 		LOGNOTICE("JDC failed to send AllocateMiningJobToken");
 		return;
 	}
@@ -1102,6 +1109,7 @@ static bool sess_declare(struct sv2_jdc_template *t)
 	size_t olen, need, plen = 0;
 	uint16_t payouts_len;
 	uint32_t request_id;
+	uint64_t generation;
 	bool sent = false, installed = false;
 	int hole, i;
 
@@ -1162,6 +1170,7 @@ static bool sess_declare(struct sv2_jdc_template *t)
 		}
 		return false;
 	}
+	generation = sess.generation;
 	m.token_len = sess.token.token_len;
 	memcpy(m.token, sess.token.token, sess.token.token_len);
 	payouts_len = sess.token.payouts_len;
@@ -1222,25 +1231,6 @@ static bool sess_declare(struct sv2_jdc_template *t)
 	}
 	m.t = sv2_jdc_template_ref(t);
 
-	/*
-	 * Publish the material before the declare goes out: the JDS asks for
-	 * transactions on the session thread within a millisecond, while this
-	 * thread is still inside sess_send().
-	 */
-	mutex_lock(&jdc_lock);
-	if (sess.pending.live && sess.pending.request_id == request_id) {
-		drop = sess.pending.m;
-		sess.pending.m = m;
-		installed = true;
-	}
-	mutex_unlock(&jdc_lock);
-	if (!installed) {
-		/* The session dropped while this was being built. */
-		LOGINFO("JDC declare req=%u abandoned before sending", request_id);
-		goto out;
-	}
-	material_clear(&drop);
-
 	if (t->txns) {
 		wtxids = ckalloc((size_t)t->txns * 32);
 		for (i = 0; i < t->txns; i++)
@@ -1265,7 +1255,27 @@ static bool sess_declare(struct sv2_jdc_template *t)
 		LOGWARNING("JDC failed to encode DeclareMiningJob (%zu bytes)", need);
 		goto out;
 	}
-	if (!sess_send(SV2_MSG_DECLARE_MINING_JOB, buf, plen)) {
+	/*
+	 * Publish the material before the declare goes out: the JDS asks for
+	 * transactions on the session thread within a millisecond, while this
+	 * thread is still inside sess_send().
+	 */
+	mutex_lock(&jdc_lock);
+	if (sess.generation == generation && sess.pending.live &&
+	    sess.pending.request_id == request_id) {
+		drop = sess.pending.m;
+		sess.pending.m = m;
+		installed = true;
+	}
+	mutex_unlock(&jdc_lock);
+	if (!installed) {
+		/* The session dropped while this was being built. */
+		LOGINFO("JDC declare req=%u abandoned before sending", request_id);
+		goto out;
+	}
+	material_clear(&drop);
+
+	if (!sess_send(generation, SV2_MSG_DECLARE_MINING_JOB, buf, plen)) {
 		LOGNOTICE("JDC failed to send DeclareMiningJob req=%u", request_id);
 		goto out;
 	}
@@ -1284,7 +1294,8 @@ out:
 	if (!sent) {
 		/* Never reached the wire: a prompt retry is free. */
 		mutex_lock(&jdc_lock);
-		declare_failed_locked(1, false);
+		if (sess.generation == generation && sess.pending.request_id == request_id)
+			declare_failed_locked(1, false);
 		mutex_unlock(&jdc_lock);
 	}
 	return sent;
@@ -1354,6 +1365,34 @@ static void custom_failed_locked(int delay)
 	sess.retry_after = time(NULL) + delay;
 }
 
+/* Validate untrusted positions and wire size before allocating a reply. */
+static bool missing_reply_size(const struct sv2_jdc_template *t,
+			       const struct sv2_provide_missing_transactions *req,
+			       size_t *size)
+{
+	uint8_t seen[(SV2_MAX_JD_TXNS + 7) / 8] = {0};
+	size_t need = 6;
+	unsigned int i;
+
+	*size = 0;
+	if (t->txns < 0 || t->txns > SV2_MAX_JD_TXNS || req->unknown_count > t->txns)
+		return false;
+	for (i = 0; i < req->unknown_count; i++) {
+		unsigned int pos = req->unknown_tx_position_list[i];
+		uint32_t len;
+
+		if (pos >= (unsigned int)t->txns || (seen[pos / 8] & (1u << (pos % 8))))
+			return false;
+		seen[pos / 8] |= 1u << (pos % 8);
+		len = t->txn[pos].len;
+		if (len > SV2_MAX_TX_BYTES || 3u + len > SV2_MAX_JD_PAYLOAD - need)
+			return false;
+		need += 3u + len;
+	}
+	*size = need;
+	return true;
+}
+
 /* Reply to ProvideMissingTransactions with the raw bytes of the positions the
  * JDS is missing, in the order it asked for them. */
 static void sess_provide_missing(const uint8_t *pay, uint32_t plen)
@@ -1383,15 +1422,10 @@ static void sess_provide_missing(const uint8_t *pay, uint32_t plen)
 			  req.request_id);
 		goto out;
 	}
-	/* Positions index the wtxid list we sent, so anything outside it means
-	 * the JDS and we disagree about the declare — abandon it. */
-	for (i = 0; i < req.unknown_count; i++) {
-		if (req.unknown_tx_position_list[i] >= t->txns) {
-			LOGWARNING("JDC ProvideMissingTransactions position %u outside "
-				   "our %d transactions", req.unknown_tx_position_list[i],
-				   t->txns);
-			goto out;
-		}
+	if (!missing_reply_size(t, &req, &need)) {
+		LOGWARNING("JDC invalid or oversized ProvideMissingTransactions req=%u",
+			   req.request_id);
+		goto out;
 	}
 
 	memset(&rep, 0, sizeof(rep));
@@ -1411,14 +1445,13 @@ static void sess_provide_missing(const uint8_t *pay, uint32_t plen)
 		rep.transactions = txs;
 		rep.tx_lens = lens;
 	}
-	need = sv2_provide_missing_tx_success_encoded_size(&rep);
 	buf = ckalloc(need);
 	if (!sv2_encode_provide_missing_transactions_success(buf, need, &elen, &rep)) {
 		LOGWARNING("JDC failed to encode %u missing transactions (%zu bytes)",
 			   rep.tx_count, need);
 		goto out;
 	}
-	if (!sess_send(SV2_MSG_PROVIDE_MISSING_TRANSACTIONS_SUCCESS, buf, elen)) {
+	if (!sess_send(0, SV2_MSG_PROVIDE_MISSING_TRANSACTIONS_SUCCESS, buf, elen)) {
 		LOGNOTICE("JDC failed to send ProvideMissingTransactions.Success");
 		goto out;
 	}
@@ -1607,11 +1640,15 @@ void sv2_jdc_solved(const struct sv2_jdc_solution *sol)
 	uint8_t buf[SV2_PUSH_SOLUTION_MAX_BYTES];
 	size_t plen = 0;
 	int accepted = 0;
+	uint64_t generation;
+	bool ready;
 
 	if (!sol || !sol->t)
 		return;
 	mutex_lock(&jdc_lock);
 	sess.solutions++;
+	generation = sess.generation;
+	ready = sess.ready;
 	mutex_unlock(&jdc_lock);
 
 	/*
@@ -1632,8 +1669,8 @@ void sv2_jdc_solved(const struct sv2_jdc_solution *sol)
 		ps.ntime = sol->ntime;
 		ps.nbits = sol->nbits;
 		ps.version = sol->version;
-		if (sv2_encode_push_solution(buf, sizeof(buf), &plen, &ps) &&
-		    sess_send(SV2_MSG_PUSH_SOLUTION, buf, plen)) {
+		if (ready && sv2_encode_push_solution(buf, sizeof(buf), &plen, &ps) &&
+		    sess_send(generation, SV2_MSG_PUSH_SOLUTION, buf, plen)) {
 			LOGWARNING("JDC PushSolution sent for height %d nonce %08x "
 				   "enonce %u bytes", sol->t->height, sol->nonce,
 				   sol->extranonce_len);
@@ -1699,7 +1736,8 @@ static void sess_handle_frame(const uint8_t *frame, size_t flen)
 	const uint8_t *pay;
 	uint32_t plen;
 
-	if (!sv2_decode_header(frame, flen, &fr))
+	if (!sv2_decode_header(frame, flen, &fr) ||
+	    (fr.extension_type & SV2_EXTENSION_MASK))
 		return;
 	if (fr.msg_length > SV2_MAX_JD_PAYLOAD ||
 	    flen < SV2_FRAME_HEADER_LEN + fr.msg_length)
@@ -1961,7 +1999,7 @@ static bool sess_service(void)
 
 		if (rc == 1) {
 			sess.last_rx = time(NULL);
-			sess.tx_since_rx = false;
+			__atomic_store_n(&sess.tx_since_rx, false, __ATOMIC_RELAXED);
 			sess_handle_frame(plain, plainlen);
 			dealloc(plain);
 			continue;
@@ -1975,17 +2013,23 @@ static bool sess_service(void)
 
 static bool sess_connect(void)
 {
+	bool handshaken;
+
+	/* Lifecycle and outbound Noise state share one lock. No old sender may
+	 * observe a half-built replacement session or a reused socket fd. */
+	mutex_lock(&sess.send_lock);
+	mutex_lock(&jdc_lock);
+	sess.generation++;
+	mutex_unlock(&jdc_lock);
 	sess.fd = connect_socket(sess.host, sess.port);
-	if (sess.fd < 0) {
-		LOGINFO("JDC failed to connect to JDS %s:%s", sess.host, sess.port);
-		return false;
-	}
-	if (!sess_handshake() || !sess_setup()) {
+	handshaken = sess.fd >= 0 && sess_handshake();
+	mutex_unlock(&sess.send_lock);
+	if (!handshaken || !sess_setup()) {
 		sess_disconnect();
 		return false;
 	}
 	sess.last_rx = time(NULL);
-	sess.tx_since_rx = false;
+	__atomic_store_n(&sess.tx_since_rx, false, __ATOMIC_RELAXED);
 	mutex_lock(&jdc_lock);
 	sess.ready = true;
 	mutex_unlock(&jdc_lock);
@@ -2032,7 +2076,7 @@ static void *jdc_session(void __maybe_unused *arg)
 			 * after something we sent as a dead session and rebuild it
 			 * rather than keep declaring into it.
 			 */
-			if (sess.tx_since_rx &&
+			if (__atomic_load_n(&sess.tx_since_rx, __ATOMIC_RELAXED) &&
 			    now - sess.last_rx >= SV2_JDC_SILENCE_SECS) {
 				LOGWARNING("JDC no response from JDS %s:%s for %ds, "
 					   "dropping the session", sess.host, sess.port,

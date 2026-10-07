@@ -25,9 +25,26 @@
 #include "sv2_types.h"
 #include "sv2_work.h"
 
+/* Nonce lengths are fixed at startup. Standard channels share nonce1length;
+ * extended channels share nonce1length + nonce2length (the full pool space).
+ * Spec 5.2.3 requires separate groups for these unequal full extranonce sizes,
+ * and reserves their IDs in the same namespace as mining channel IDs. */
+#define SV2_STANDARD_GROUP_ID	0
+#define SV2_EXTENDED_GROUP_ID	1
+#define SV2_FIRST_CHANNEL_ID	2
+/* Post-handshake admission limits, independent of socket send queues. */
+#define SV2_MAX_CHANNELS_CLIENT	256
+#define SV2_MAX_CHANNELS_GLOBAL	4096
+#define SV2_MAX_SHARES_CLIENT	256
+#define SV2_MAX_SHARES_GLOBAL	8192
+#define SV2_MAX_SHARE_BYTES_CLIENT (4u << 20)
+#define SV2_MAX_SHARE_BYTES_GLOBAL (64u << 20)
+
 struct sv2_client {
 	UT_hash_handle hh;
 	int64_t client_id;
+	unsigned int queued_shares;
+	size_t queued_share_bytes;
 	bool setup_ok;
 	uint32_t flags;
 	uint32_t next_channel_id;
@@ -55,6 +72,8 @@ enum sv2_work_src {
 
 /* Snapshot of an accepted custom job for share reconstruction */
 struct sv2_custom_job {
+	unsigned int refs; /* group slots share immutable material under sv2_lock */
+	bool token_pinned;
 	uint32_t job_id;
 	uint32_t version;
 	uint8_t prev_hash[32];	/* as on wire (U256 LE / header-internal) */
@@ -78,6 +97,8 @@ struct sv2_custom_job {
  * only decodes/looks up job and enqueues; hashing runs on sprocessor.
  */
 struct sv2_share_job {
+	struct sv2_client *owner;
+	size_t charged_bytes;
 	int64_t connector_id;
 	int64_t instance_id;
 	int64_t workbase_id;
@@ -97,6 +118,7 @@ struct sv2_share_job {
 };
 
 struct sv2_job_slot {
+	double diff;	/* immutable once this job is activated */
 	uint32_t job_id;
 	int64_t workbase_id;
 	bool used;
@@ -126,6 +148,8 @@ struct sv2_channel {
 	bool standard;
 	char user_identity[SV2_MAX_STR_LEN + 1];
 	double diff;
+	double advertised_diff;	/* last target queued on the wire */
+	mutex_t publish_lock;	/* order target and job publication */
 	double min_diff;	/* highdiff-port floor (0 = none), see server_diff_floor() */
 	uint8_t enonce1[16];
 	uint8_t enonce1_len;
@@ -149,6 +173,8 @@ struct sv2_channel {
 	tv_t batch_start;
 };
 
+static unsigned int sv2_queued_shares;
+static size_t sv2_queued_share_bytes;
 static struct sv2_client *sv2_clients;
 static struct sv2_channel *sv2_channels;
 static mutex_t sv2_lock;
@@ -204,6 +230,7 @@ static void channel_finish_free(struct sv2_channel *ch)
 	if (!ch)
 		return;
 	flush_success_batch(ch);
+	mutex_destroy(&ch->publish_lock);
 	dealloc(ch);
 }
 
@@ -239,8 +266,10 @@ static void channel_put(struct sv2_channel *ch)
 
 static void free_custom_job(struct sv2_custom_job *cj)
 {
-	if (!cj)
+	if (!cj || --cj->refs)
 		return;
+	if (cj->token_pinned)
+		sv2_jd_unpin_token(cj->token, cj->token_len);
 	dealloc(cj->coinbase_tx_outputs);
 	dealloc(cj);
 }
@@ -266,6 +295,7 @@ static void channel_note_job_locked(struct sv2_channel *ch, uint32_t job_id,
 	}
 	slot->job_id = job_id;
 	slot->workbase_id = workbase_id;
+	slot->diff = ch->advertised_diff;
 	slot->used = true;
 	slot->custom = custom;
 	slot->version = version;
@@ -282,7 +312,7 @@ static void channel_note_job_locked(struct sv2_channel *ch, uint32_t job_id,
 static bool channel_lookup_job_locked(struct sv2_channel *ch, uint32_t job_id,
 				      int64_t *wb_out, bool *custom_out,
 				      struct sv2_custom_job **cj_out,
-				      uint32_t *version_out, bool *rolling_out)
+				      uint32_t *version_out, bool *rolling_out, double *diff_out)
 {
 	int i;
 
@@ -295,6 +325,8 @@ static bool channel_lookup_job_locked(struct sv2_channel *ch, uint32_t job_id,
 	for (i = 0; i < SV2_JOB_RING; i++) {
 		if (ch->jobs[i].used && ch->jobs[i].job_id == job_id) {
 			*wb_out = ch->jobs[i].workbase_id;
+			if (diff_out)
+				*diff_out = ch->jobs[i].diff;
 			if (custom_out)
 				*custom_out = ch->jobs[i].custom;
 			if (cj_out && ch->jobs[i].custom)
@@ -364,7 +396,7 @@ static struct sv2_client *client_get(int64_t client_id, bool create)
 	if (!c && create) {
 		c = ckzalloc(sizeof(*c));
 		c->client_id = client_id;
-		c->next_channel_id = 1;
+		c->next_channel_id = SV2_FIRST_CHANNEL_ID;
 		c->refs = 1; /* hashed */
 		HASH_ADD_I64(sv2_clients, client_id, c);
 	}
@@ -382,6 +414,28 @@ static void client_put(struct sv2_client *c)
 	mutex_lock(&sv2_lock);
 	client_unref_locked(c);
 	mutex_unlock(&sv2_lock);
+}
+
+/* Zero marks exhaustion: never wrap into group IDs or reuse channel IDs. */
+static uint32_t alloc_channel_id(struct sv2_client *c)
+{
+	struct sv2_channel *ch, *tmp;
+	unsigned int count = 0;
+	uint32_t id = 0;
+
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id == c->client_id)
+			count++;
+	}
+	if (count < SV2_MAX_CHANNELS_CLIENT && HASH_COUNT(sv2_channels) < SV2_MAX_CHANNELS_GLOBAL) {
+		id = c->next_channel_id;
+		if (id)
+			c->next_channel_id++;
+	}
+	mutex_unlock(&sv2_lock);
+	return id;
 }
 
 void sv2_strat_drop_client(int64_t client_id)
@@ -514,8 +568,7 @@ static void flush_success_batch(struct sv2_channel *ch)
 	count = ch->batch_count;
 	shares_sum = ch->batch_shares_sum;
 	ch->batch_count = 0;
-	/* Keep batch_last_seq as a session high-water mark so a post-flush
-	 * straggler with a lower seq cannot recede last_sequence_number. */
+	ch->batch_last_seq = 0;
 	ch->batch_shares_sum = 0;
 	memset(&ch->batch_start, 0, sizeof(ch->batch_start));
 	mutex_unlock(&sv2_lock);
@@ -546,9 +599,8 @@ static void note_share_success(struct sv2_channel *ch, uint32_t sequence_number,
 	if (!ch->batch_count)
 		copy_tv(&ch->batch_start, &now);
 	ch->batch_count++;
-	/* Highest accepted seq (sshareq can process shares out of order). */
-	if (sequence_number > ch->batch_last_seq)
-		ch->batch_last_seq = sequence_number;
+	/* Most recently accepted submission in this batch, including wraparound. */
+	ch->batch_last_seq = sequence_number;
 	ch->batch_shares_sum += share_diff ? share_diff : 1;
 	age = tvdiff(&now, &ch->batch_start);
 	if (ch->batch_count >= SV2_SUCCESS_BATCH_MAX || age >= SV2_SUCCESS_BATCH_SECS)
@@ -556,6 +608,32 @@ static void note_share_success(struct sv2_channel *ch, uint32_t sequence_number,
 	mutex_unlock(&sv2_lock);
 	if (do_flush)
 		flush_success_batch(ch);
+}
+
+/* Called on the connector's one-second tick, independent of new shares/jobs. */
+void sv2_strat_flush_aged_shares(void)
+{
+	struct sv2_channel *ch, *tmp, **list = NULL;
+	unsigned int n = 0, i;
+	tv_t now;
+
+	tv_time(&now);
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (!ch->batch_count || tvdiff(&now, &ch->batch_start) < SV2_SUCCESS_BATCH_SECS)
+			continue;
+		if (!list)
+			list = ckalloc(HASH_COUNT(sv2_channels) * sizeof(*list));
+		ch->refs++;
+		list[n++] = ch;
+	}
+	mutex_unlock(&sv2_lock);
+	for (i = 0; i < n; i++) {
+		flush_success_batch(list[i]);
+		channel_put(list[i]);
+	}
+	free(list);
 }
 
 /* Compare LE U256 targets: >0 if a is easier (larger) than b. */
@@ -571,20 +649,19 @@ static int target_cmp_le(const uint8_t a[32], const uint8_t b[32])
 }
 
 /*
- * True if a wire f32 is finite. Screened by bit pattern deliberately: ckpool
+ * True if a wire hashrate is finite and nonnegative (excluding negative zero). Screened by bit pattern deliberately: ckpool
  * unmasks FE_INVALID, and on x86-64 both (double)f and isfinite(f) compile to
  * SSE ops that raise #IA — and so SIGFPE — when f is a *signalling* NaN. A
  * guard written as isfinite(f) faults on exactly the input it exists to
  * reject, so an untrusted f32 must never reach the FPU until it is known
- * finite. Sign is not considered; ordered comparisons are safe once the value
- * cannot be NaN.
+ * finite. Test the sign bit too, since negative zero is forbidden by spec 3.2.
  */
-static bool wire_f32_finite(float f)
+static bool wire_f32_hashrate_valid(float f)
 {
 	uint32_t bits;
 
 	memcpy(&bits, &f, sizeof(bits));
-	return (bits & 0x7f800000u) != 0x7f800000u;
+	return !(bits & 0x80000000u) && (bits & 0x7f800000u) != 0x7f800000u;
 }
 
 /*
@@ -629,7 +706,7 @@ static void choose_channel_diff(float nominal_hr, const uint8_t max_target[32],
 		mindiff = floor;
 
 	/* Wire f32 is untrusted — reject non-finite / negative before math. */
-	if (wire_f32_finite(nominal_hr) && nominal_hr > 0.0f)
+	if (wire_f32_hashrate_valid(nominal_hr) && nominal_hr > 0.0f)
 		hr = (double)nominal_hr;
 	else
 		hr = 0.0;
@@ -826,6 +903,7 @@ static void push_pool_job_extended(struct sv2_channel *ch, bool future_first)
 
 static void push_pool_job(struct sv2_channel *ch, bool future_first)
 {
+	mutex_lock(&ch->publish_lock);
 	/* New job invalidates old work; flush any pending success batch first
 	 * so sequence numbers stay meaningful to the client. */
 	flush_success_batch(ch);
@@ -833,6 +911,7 @@ static void push_pool_job(struct sv2_channel *ch, bool future_first)
 		push_pool_job_standard(ch, future_first);
 	else
 		push_pool_job_extended(ch, future_first);
+	mutex_unlock(&ch->publish_lock);
 }
 
 /* Build SetTarget from channel state under sv2_lock (diff / max_target races). */
@@ -850,6 +929,7 @@ static void push_set_target(struct sv2_channel *ch)
 
 	if (!ch)
 		return;
+	mutex_lock(&ch->publish_lock);
 	ensure_lock();
 	mutex_lock(&sv2_lock);
 	diff = ch->diff;
@@ -869,14 +949,15 @@ static void push_set_target(struct sv2_channel *ch)
 		diff = clamp_channel_diff(diff_from_target(max_target));
 		ch->diff = diff;
 	}
+	ch->advertised_diff = diff;
 	mutex_unlock(&sv2_lock);
 
 	memset(&st, 0, sizeof(st));
 	st.channel_id = channel_id;
 	memcpy(st.maximum_target, wire_target, 32);
-	if (!sv2_encode_set_target(pbuf, sizeof(pbuf), &plen, &st))
-		return;
-	queue_frame(client_id, SV2_MSG_SET_TARGET, true, pbuf, plen);
+	if (sv2_encode_set_target(pbuf, sizeof(pbuf), &plen, &st))
+		queue_frame(client_id, SV2_MSG_SET_TARGET, true, pbuf, plen);
+	mutex_unlock(&ch->publish_lock);
 }
 
 static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
@@ -914,7 +995,8 @@ static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
 	 * client, so refuse it when no version mask is configured.
 	 */
 	{
-		uint32_t bad_flags = 0;
+		uint32_t bad_flags = sc.flags & ~(SV2_FLAG_REQUIRES_STANDARD_JOBS |
+			SV2_FLAG_REQUIRES_WORK_SELECTION | SV2_FLAG_REQUIRES_VERSION_ROLLING);
 
 		if ((sc.flags & SV2_FLAG_REQUIRES_WORK_SELECTION) && !sv2_jd_enabled())
 			bad_flags |= SV2_FLAG_REQUIRES_WORK_SELECTION;
@@ -942,6 +1024,16 @@ static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
 	return reply_frame(SV2_MSG_SETUP_CONNECTION_SUCCESS, false, pbuf, plen, replylen);
 }
 
+/* The authentication call runs without sv2_lock and may race a disconnect.
+ * Revalidate the exact client object before publishing its new session. */
+static bool client_live_locked(const struct sv2_client *c)
+{
+	struct sv2_client *live;
+
+	HASH_FIND_I64(sv2_clients, &c->client_id, live);
+	return live == c;
+}
+
 static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payload,
 				     uint32_t len, size_t *replylen)
 {
@@ -959,12 +1051,34 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 		return NULL;
 	if (!sv2_decode_open_standard_channel(payload, len, &o))
 		return NULL;
+	if (workername_error(o.user_identity)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-username");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
+	if (!wire_f32_hashrate_valid(o.nominal_hash_rate)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-nominal-hashrate");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	floor = server_diff_floor(c->server);
 	choose_channel_diff(o.nominal_hash_rate, o.max_target, floor, &diff);
-	ch_id = c->next_channel_id++;
-	if (!ch_id)
-		ch_id = c->next_channel_id++;
+	ch_id = alloc_channel_id(c);
+	if (!ch_id) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "channel-limit-reached");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	ch = ckzalloc(sizeof(*ch));
 	ch->client_id = c->client_id;
@@ -992,6 +1106,7 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
 	}
 	ch->instance_id = instance_id;
+	mutex_init(&ch->publish_lock);
 
 	/*
 	 * refs = 2: table pin + open-handler pin. Drop can unhash the table
@@ -999,6 +1114,13 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	 */
 	ensure_lock();
 	mutex_lock(&sv2_lock);
+	if (!client_live_locked(c)) {
+		mutex_unlock(&sv2_lock);
+		stratifier_sv2_close_session(instance_id);
+		mutex_destroy(&ch->publish_lock);
+		dealloc(ch);
+		return NULL;
+	}
 	ch->refs = 2;
 	HASH_ADD(hh, sv2_channels, key, sizeof(ch->key), ch);
 	memset(&ok, 0, sizeof(ok));
@@ -1011,7 +1133,8 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	}
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
-	ok.group_channel_id = 0;
+	ch->advertised_diff = ch->diff;
+	ok.group_channel_id = SV2_STANDARD_GROUP_ID;
 	mutex_unlock(&sv2_lock);
 
 	if (!sv2_encode_open_standard_channel_success(pbuf, sizeof(pbuf), &plen, &ok)) {
@@ -1052,11 +1175,41 @@ static uint8_t *handle_open_standard(struct sv2_client *c, const uint8_t *payloa
 	return NULL;
 }
 
+/* Reserve before allocating/copying job material. Caller holds sv2_lock. */
+static bool reserve_share_locked(struct sv2_client *c, size_t bytes)
+{
+	if (c->queued_shares >= SV2_MAX_SHARES_CLIENT ||
+	    sv2_queued_shares >= SV2_MAX_SHARES_GLOBAL ||
+	    bytes > SV2_MAX_SHARE_BYTES_CLIENT - c->queued_share_bytes ||
+	    bytes > SV2_MAX_SHARE_BYTES_GLOBAL - sv2_queued_share_bytes)
+		return false;
+	c->queued_shares++;
+	c->queued_share_bytes += bytes;
+	sv2_queued_shares++;
+	sv2_queued_share_bytes += bytes;
+	c->refs++;
+	return true;
+}
+
+static void release_share(struct sv2_client *c, size_t bytes)
+{
+	if (!c)
+		return;
+	mutex_lock(&sv2_lock);
+	c->queued_shares--;
+	c->queued_share_bytes -= bytes;
+	sv2_queued_shares--;
+	sv2_queued_share_bytes -= bytes;
+	client_unref_locked(c);
+	mutex_unlock(&sv2_lock);
+}
+
 static void free_share_job(struct sv2_share_job *job)
 {
 	if (!job)
 		return;
 	free_custom_job(job->custom);
+	release_share(job->owner, job->charged_bytes);
 	dealloc(job);
 }
 
@@ -1124,7 +1277,7 @@ void sv2_strat_process_share_job(void *jobp)
 					   hash, &sdiff, ebuf, sizeof(ebuf)))
 			goto err;
 		if (!stratifier_sv2_account_share(job->instance_id, job->workbase_id,
-						  hash, sdiff, ebuf, sizeof(ebuf),
+						  hash, sdiff, job->ch_diff, ebuf, sizeof(ebuf),
 						  &netdiff))
 			goto err;
 		if (netdiff && job->custom->token_len) {
@@ -1177,7 +1330,7 @@ void sv2_strat_process_share_job(void *jobp)
 		if (job->is_standard || !job->extranonce_len) {
 			if (!stratifier_sv2_submit_share(job->instance_id, job->workbase_id,
 							 job->ntime, job->nonce, job->version,
-							 NULL, ebuf, sizeof(ebuf), &sdiff))
+							 NULL, job->ch_diff, ebuf, sizeof(ebuf), &sdiff))
 				goto err;
 		} else {
 			if (job->extranonce_len * 2 >= sizeof(nonce2hex)) {
@@ -1187,7 +1340,7 @@ void sv2_strat_process_share_job(void *jobp)
 			__bin2hex(nonce2hex, job->extranonce, job->extranonce_len);
 			if (!stratifier_sv2_submit_share(job->instance_id, job->workbase_id,
 							 job->ntime, job->nonce, job->version,
-							 nonce2hex, ebuf, sizeof(ebuf), &sdiff))
+							 nonce2hex, job->ch_diff, ebuf, sizeof(ebuf), &sdiff))
 				goto err;
 		}
 		if (ch)
@@ -1227,7 +1380,7 @@ static uint8_t *handle_submit_standard(struct sv2_client *c, const uint8_t *payl
 	struct sv2_share_job *job;
 	int64_t instance_id = 0, workbase_id = 0;
 	double ch_diff = 0;
-	bool ok_job = false;
+	bool ok_job = false, reserved;
 	uint32_t job_version = 0;
 	bool version_rolling = false;
 
@@ -1245,9 +1398,8 @@ static uint8_t *handle_submit_standard(struct sv2_client *c, const uint8_t *payl
 	ensure_lock();
 	mutex_lock(&sv2_lock);
 	ok_job = channel_lookup_job_locked(ch, sub.job_id, &workbase_id, NULL, NULL,
-					   &job_version, &version_rolling);
+					   &job_version, &version_rolling, &ch_diff);
 	instance_id = ch->instance_id;
-	ch_diff = ch->diff;
 	mutex_unlock(&sv2_lock);
 	channel_put(ch);
 
@@ -1258,7 +1410,15 @@ static uint8_t *handle_submit_standard(struct sv2_client *c, const uint8_t *payl
 		return submit_error_reply(sub.channel_id, sub.sequence_number,
 					  "invalid-share", replylen);
 
+	mutex_lock(&sv2_lock);
+	reserved = reserve_share_locked(c, sizeof(*job));
+	mutex_unlock(&sv2_lock);
+	if (!reserved)
+		return submit_error_reply(sub.channel_id, sub.sequence_number,
+					  "too-many-submissions", replylen);
 	job = ckzalloc(sizeof(*job));
+	job->owner = c;
+	job->charged_bytes = sizeof(*job);
 	job->connector_id = c->client_id;
 	job->instance_id = instance_id;
 	job->workbase_id = workbase_id;
@@ -1304,6 +1464,22 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	}
 	if (!sv2_decode_open_extended_channel(payload, len, &o))
 		return NULL;
+	if (workername_error(o.user_identity)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-username");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
+	if (!wire_f32_hashrate_valid(o.nominal_hash_rate)) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "invalid-nominal-hashrate");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	floor = server_diff_floor(c->server);
 	choose_channel_diff(o.nominal_hash_rate, o.max_target, floor, &diff);
@@ -1322,9 +1498,15 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	}
 	/* Give full pool enonce2 space when client min is smaller (more headroom). */
 
-	ch_id = c->next_channel_id++;
-	if (!ch_id)
-		ch_id = c->next_channel_id++;
+	ch_id = alloc_channel_id(c);
+	if (!ch_id) {
+		memset(&err, 0, sizeof(err));
+		err.request_id = o.request_id;
+		snprintf(err.error_code, sizeof(err.error_code), "channel-limit-reached");
+		if (!sv2_encode_open_channel_error(pbuf, sizeof(pbuf), &plen, &err))
+			return NULL;
+		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
+	}
 
 	ch = ckzalloc(sizeof(*ch));
 	ch->client_id = c->client_id;
@@ -1352,10 +1534,18 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 		return reply_frame(SV2_MSG_OPEN_MINING_CHANNEL_ERROR, false, pbuf, plen, replylen);
 	}
 	ch->instance_id = instance_id;
+	mutex_init(&ch->publish_lock);
 
 	/* refs = 2: table pin + open-handler pin (see handle_open_standard). */
 	ensure_lock();
 	mutex_lock(&sv2_lock);
+	if (!client_live_locked(c)) {
+		mutex_unlock(&sv2_lock);
+		stratifier_sv2_close_session(instance_id);
+		mutex_destroy(&ch->publish_lock);
+		dealloc(ch);
+		return NULL;
+	}
 	ch->refs = 2;
 	HASH_ADD(hh, sv2_channels, key, sizeof(ch->key), ch);
 	memset(&ok, 0, sizeof(ok));
@@ -1369,7 +1559,8 @@ static uint8_t *handle_open_extended(struct sv2_client *c, const uint8_t *payloa
 	ok.extranonce_size = ch->extranonce_size;
 	ok.extranonce_prefix_len = ch->enonce1_len;
 	memcpy(ok.extranonce_prefix, ch->enonce1, ch->enonce1_len);
-	ok.group_channel_id = 0;
+	ch->advertised_diff = ch->diff;
+	ok.group_channel_id = SV2_EXTENDED_GROUP_ID;
 	mutex_unlock(&sv2_lock);
 
 	if (!sv2_encode_open_extended_channel_success(pbuf, sizeof(pbuf), &plen, &ok)) {
@@ -1410,13 +1601,15 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	struct sv2_set_custom_mining_job req;
 	struct sv2_set_custom_mining_job_success ok;
 	struct sv2_set_custom_mining_job_error err;
-	struct sv2_channel *ch;
-	struct sv2_custom_job *cj;
+	struct sv2_channel *ch, *tmp, *members[SV2_MAX_CHANNELS_CLIENT];
+	unsigned int nmembers = 0, n;
+	struct sv2_custom_job *cj = NULL;
 	uint8_t pbuf[128];
 	size_t plen = 0;
-	uint32_t job_id;
+	uint32_t job_id = 0;
 	int64_t wb_id = 0;
-	uint32_t tip_ver, tip_ntime, tip_nbits;
+	uint32_t tip_mintime, tip_nbits;
+	int tip_height;
 	uint8_t tip_prev[32];
 	uint32_t err_ch = 0, err_req = 0;
 	int i;
@@ -1437,18 +1630,32 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 		goto err;
 	}
 
-	ch = channel_find_ref(c->client_id, req.channel_id);
-	if (!ch || ch->standard || !ch->instance_id) {
-		/* Spec: extended or group only; standard ignored/rejected */
+	/* Group membership is fixed by channel kind and full extranonce size.
+	 * Take all references together so an error never installs a partial group. */
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id != c->client_id || ch->standard || !ch->instance_id)
+			continue;
+		if (req.channel_id == ch->channel_id || req.channel_id == SV2_EXTENDED_GROUP_ID) {
+			ch->refs++;
+			members[nmembers++] = ch;
+		}
+	}
+	mutex_unlock(&sv2_lock);
+	if (!nmembers) {
+		/* A group containing only standard channels is a no-op (5.3.18). */
+		if (req.channel_id == SV2_STANDARD_GROUP_ID) {
+			sv2_set_custom_mining_job_free(&req);
+			return NULL;
+		}
 		snprintf(ecode, sizeof(ecode), "invalid-channel-id");
-		channel_put(ch);
 		goto err;
 	}
+	ch = members[0];
 
 	if (!req.mining_job_token_len ||
 	    !sv2_jd_token_is_declared(req.mining_job_token, req.mining_job_token_len)) {
 		snprintf(ecode, sizeof(ecode), "invalid-mining-job-token");
-		channel_put(ch);
 		goto err;
 	}
 	/* Spec §6.4.3: coinbase outputs must fund Allocate payout script. */
@@ -1457,46 +1664,55 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 					      req.coinbase_tx_outputs,
 					      req.coinbase_tx_outputs_len)) {
 		snprintf(ecode, sizeof(ecode), "invalid-coinbase-tx-outputs");
-		channel_put(ch);
 		goto err;
 	}
 
-	/* Tip must match declared prev_hash (stale custom rejected after tip) */
-	if (!stratifier_sv2_tip_for_jd(&tip_ver, &tip_ntime, &tip_nbits, tip_prev)) {
+	/* Obtain one coherent tip context, including the chain's MTP floor. */
+	if (!stratifier_sv2_custom_tip(tip_prev, &tip_nbits, &tip_mintime,
+				      &tip_height, &wb_id)) {
+		snprintf(ecode, sizeof(ecode), "validation-unavailable");
+		goto err;
+	}
+	if (memcmp(req.prev_hash, tip_prev, 32)) {
 		snprintf(ecode, sizeof(ecode), "stale-prev-hash");
-		channel_put(ch);
+		goto err;
+	}
+	if (req.min_ntime < tip_mintime || (uint64_t)req.min_ntime > (uint64_t)time(NULL) + 7200) {
+		snprintf(ecode, sizeof(ecode), "invalid-ntime");
+		goto err;
+	}
+	if (req.nbits != tip_nbits) {
+		snprintf(ecode, sizeof(ecode), "invalid-nbits");
 		goto err;
 	}
 	{
-		uint8_t req_rev[32];
-		int j;
+		uint8_t height[5];
+		int hlen;
 
-		for (j = 0; j < 32; j++)
-			req_rev[j] = req.prev_hash[31 - j];
-		if (memcmp(req.prev_hash, tip_prev, 32) != 0 &&
-		    memcmp(req_rev, tip_prev, 32) != 0) {
-			snprintf(ecode, sizeof(ecode), "stale-prev-hash");
-			channel_put(ch);
+		if (tip_height >= 0 && tip_height <= 16) {
+			height[0] = tip_height ? 0x50 + tip_height : 0;
+			hlen = 1;
+		} else
+			hlen = ser_number(height, tip_height);
+		if (tip_height < 1 || req.coinbase_prefix_len < hlen ||
+		    memcmp(height, req.coinbase_prefix, hlen) ||
+		    (size_t)req.coinbase_prefix_len + ch->enonce1_len + ch->extranonce_size > 100) {
+			snprintf(ecode, sizeof(ecode), "invalid-coinbase-prefix");
 			goto err;
 		}
-		/* Always store wire/header-internal prev for share hashing */
-		memcpy(req.prev_hash, tip_prev, 32);
 	}
-
-	if (req.merkle_count > SV2_MAX_MERKLE_PATH) {
-		snprintf(ecode, sizeof(ecode), "invalid-merkle-path");
-		channel_put(ch);
+	if (!sv2_jd_custom_matches(&req, ch->enonce1_len + ch->extranonce_size)) {
+		snprintf(ecode, sizeof(ecode), "invalid-custom-job");
 		goto err;
 	}
 
-	{
-		struct sv2_work_snap snap;
-
-		if (stratifier_sv2_snapshot_work(&snap, ch->instance_id))
-			wb_id = snap.wb_id;
+	if (!sv2_jd_pin_token(req.mining_job_token, req.mining_job_token_len)) {
+		snprintf(ecode, sizeof(ecode), "invalid-mining-job-token");
+		goto err;
 	}
-
 	cj = ckzalloc(sizeof(*cj));
+	cj->refs = 1;
+	cj->token_pinned = true;
 	cj->version = req.version;
 	memcpy(cj->prev_hash, req.prev_hash, 32);
 	cj->min_ntime = req.min_ntime;
@@ -1518,21 +1734,48 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	cj->token_len = req.mining_job_token_len;
 	memcpy(cj->token, req.mining_job_token, req.mining_job_token_len);
 
-	ensure_lock();
+	for (n = 0; n < nmembers; n++)
+		mutex_lock(&members[n]->publish_lock);
 	mutex_lock(&sv2_lock);
-	/*
-	 * Do not wipe previous custom job_ids — JDC rotates SetCustom every few
-	 * seconds while in-flight shares still reference the prior job_id.
-	 * Ring slots retain custom material until overwritten (SV2_JOB_RING).
-	 */
-	job_id = ++ch->job_seq;
-	if (!job_id)
-		job_id = ++ch->job_seq;
+	if (!client_live_locked(c)) {
+		mutex_unlock(&sv2_lock);
+		for (n = nmembers; n > 0; n--)
+			mutex_unlock(&members[n - 1]->publish_lock);
+		snprintf(ecode, sizeof(ecode), "invalid-channel-id");
+		goto err;
+	}
+	/* One identifier applies to every extended member of a group. Advance
+	 * beyond each member's allocator and avoid retained IDs on wraparound. */
+	for (n = 0; n < nmembers; n++) {
+		if (members[n]->job_seq > job_id)
+			job_id = members[n]->job_seq;
+	}
+	while (42) {
+		bool used = false;
+
+		if (!++job_id)
+			job_id++;
+		for (n = 0; n < nmembers && !used; n++) {
+			for (i = 0; i < SV2_JOB_RING; i++) {
+				if (members[n]->jobs[i].used && members[n]->jobs[i].job_id == job_id) {
+					used = true;
+					break;
+				}
+			}
+		}
+		if (!used)
+			break;
+	}
 	cj->job_id = job_id;
-	ch->work_src = SV2_WORK_CUSTOM;
-	/* SetCustomMiningJob: BIP320 bits may be rolled (pool mask). */
-	channel_note_job_locked(ch, job_id, wb_id, true, cj, cj->version,
-				ckpool.version_mask != 0);
+	cj->refs = nmembers;
+	for (n = 0; n < nmembers; n++) {
+		ch = members[n];
+		ch->job_seq = job_id;
+		ch->work_src = SV2_WORK_CUSTOM;
+		channel_note_job_locked(ch, job_id, wb_id, true, cj, cj->version,
+					ckpool.version_mask != 0);
+	}
+	cj = NULL; /* the group slots own the shared material and its token pin */
 	mutex_unlock(&sv2_lock);
 
 	memset(&ok, 0, sizeof(ok));
@@ -1540,15 +1783,22 @@ static uint8_t *handle_set_custom_mining_job(struct sv2_client *c, const uint8_t
 	ok.request_id = err_req;
 	ok.job_id = job_id;
 	sv2_set_custom_mining_job_free(&req);
-	channel_put(ch);
-
-	if (!sv2_encode_set_custom_mining_job_success(pbuf, sizeof(pbuf), &plen, &ok))
-		return NULL;
+	if (sv2_encode_set_custom_mining_job_success(pbuf, sizeof(pbuf), &plen, &ok))
+		queue_frame(c->client_id, SV2_MSG_SET_CUSTOM_MINING_JOB_SUCCESS, true,
+			    pbuf, plen);
+	for (n = nmembers; n > 0; n--)
+		mutex_unlock(&members[n - 1]->publish_lock);
+	for (n = 0; n < nmembers; n++)
+		channel_put(members[n]);
 	LOGNOTICE("SV2 SetCustomMiningJob ok client %"PRId64" ch=%u job=%u",
 		  c->client_id, ok.channel_id, job_id);
-	return reply_frame(SV2_MSG_SET_CUSTOM_MINING_JOB_SUCCESS, true, pbuf, plen, replylen);
+	*replylen = 0;
+	return NULL;
 
 err:
+	free_custom_job(cj);
+	for (n = 0; n < nmembers; n++)
+		channel_put(members[n]);
 	sv2_set_custom_mining_job_free(&req);
 	memset(&err, 0, sizeof(err));
 	err.channel_id = err_ch;
@@ -1573,7 +1823,7 @@ static size_t build_custom_coinbase(uint8_t *out, size_t outsz,
 {
 	/* Shared with the JDC so the declared and custom shapes of one coinbase
 	 * cannot drift (sv2_cb.c); it also computes the scriptSig length wide and
-	 * rejects over 255 rather than relying on a wrap check. */
+	 * enforces the 100-byte consensus scriptSig limit. */
 	return sv2_cb_assemble(out, outsz, cj->coinbase_tx_version,
 			       cj->coinbase_tx_input_nSequence, cj->coinbase_tx_locktime,
 			       cj->coinbase_prefix, cj->coinbase_prefix_len,
@@ -1590,26 +1840,30 @@ static bool validate_custom_share(const struct sv2_custom_job *cj,
 				  uchar hash[32], double *sdiff_out,
 				  char *err, size_t errsz)
 {
-	uint8_t coinbase[2048];
-	size_t cblen;
+	uint8_t *coinbase;
+	size_t cblen, cbcap = (size_t)cj->coinbase_tx_outputs_len + 151;
 	uint8_t merkle_root[32], merkle_sha[64], header[80], hash1[32];
 	uint32_t le;
 	int i;
 
 	/* Same ntime window as the pool-template path (wb->ntime32 + 7000):
 	 * bound rolling above min_ntime so a runaway ntime cannot be credited. */
-	if (ntime < cj->min_ntime || ntime > cj->min_ntime + 7000) {
+	if (ntime < cj->min_ntime || (uint64_t)ntime > (uint64_t)cj->min_ntime + 7000 ||
+	    (uint64_t)ntime > (uint64_t)time(NULL) + 7200) {
 		snprintf(err, errsz, "invalid-ntime");
 		return false;
 	}
-	cblen = build_custom_coinbase(coinbase, sizeof(coinbase), cj,
+	coinbase = ckalloc(cbcap);
+	cblen = build_custom_coinbase(coinbase, cbcap, cj,
 				      enonce1, en1len, extranonce, enlen);
 	if (!cblen) {
+		free(coinbase);
 		snprintf(err, errsz, "invalid-coinbase");
 		return false;
 	}
 	/* Coinbase txid then merkle path — natural SHA256d order = wire merkle */
 	gen_hash(coinbase, merkle_root, (int)cblen);
+	free(coinbase);
 	memcpy(merkle_sha, merkle_root, 32);
 	for (i = 0; i < cj->merkle_count; i++) {
 		memcpy(merkle_sha + 32, cj->merkle_path[i], 32);
@@ -1654,7 +1908,8 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 	uint16_t en_sz = 0;
 	bool ok_job = false, is_custom = false;
 	uint32_t job_version = 0;
-	bool version_rolling = false;
+	bool version_rolling = false, reserved = false;
+	size_t charge = sizeof(struct sv2_share_job);
 	uint8_t en1_snap[16];
 	uint8_t en1_len = 0;
 
@@ -1676,18 +1931,26 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 
 		ok_job = channel_lookup_job_locked(ch, sub.base.job_id, &workbase_id,
 						   &is_custom, &cj_slot,
-						   &job_version, &version_rolling);
+						   &job_version, &version_rolling, &ch_diff);
 		instance_id = ch->instance_id;
-		ch_diff = ch->diff;
 		en_sz = ch->extranonce_size;
 		en1_len = ch->enonce1_len;
 		if (en1_len > sizeof(en1_snap))
 			en1_len = sizeof(en1_snap);
 		if (en1_len)
 			memcpy(en1_snap, ch->enonce1, en1_len);
-		if (ok_job && is_custom && cj_slot) {
+		/* Reject cheap errors before copying a possibly 64 KiB coinbase. */
+		if (ok_job && sub.extranonce_len == en_sz &&
+		    sv2_submit_version_ok(sub.base.version, job_version, version_rolling)) {
+			if (is_custom && cj_slot)
+				charge += sizeof(*cj_slot) + cj_slot->coinbase_tx_outputs_len;
+			reserved = reserve_share_locked(c, charge);
+		}
+		if (reserved && is_custom && cj_slot) {
 			cj_copy = ckzalloc(sizeof(*cj_copy));
 			*cj_copy = *cj_slot;
+			cj_copy->refs = 1;
+			cj_copy->token_pinned = sv2_jd_pin_token(cj_copy->token, cj_copy->token_len);
 			if (cj_slot->coinbase_tx_outputs_len) {
 				cj_copy->coinbase_tx_outputs =
 					ckalloc(cj_slot->coinbase_tx_outputs_len);
@@ -1716,11 +1979,19 @@ static uint8_t *handle_submit_extended(struct sv2_client *c, const uint8_t *payl
 		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
 					  "invalid-share", replylen);
 	}
-	if (is_custom && !cj_copy)
+	if (!reserved)
+		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
+					  "too-many-submissions", replylen);
+	if (is_custom && (!cj_copy || !cj_copy->token_pinned)) {
+		free_custom_job(cj_copy);
+		release_share(c, charge);
 		return submit_error_reply(sub.base.channel_id, sub.base.sequence_number,
 					  "invalid-job-id", replylen);
+	}
 
 	job = ckzalloc(sizeof(*job));
+	job->owner = c;
+	job->charged_bytes = charge;
 	job->connector_id = c->client_id;
 	job->instance_id = instance_id;
 	job->workbase_id = workbase_id;
@@ -1877,7 +2148,7 @@ uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 			break;
 		}
 		/* Spec: no response when accepted; Error only when invalid. */
-		if (!wire_f32_finite(nom_hr) || nom_hr < 0.0f) {
+		if (!wire_f32_hashrate_valid(nom_hr)) {
 			memset(&uerr, 0, sizeof(uerr));
 			uerr.channel_id = ch_id;
 			snprintf(uerr.error_code, sizeof(uerr.error_code),
