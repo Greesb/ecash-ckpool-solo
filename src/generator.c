@@ -74,6 +74,8 @@ struct notify_instance {
 	 * notify and a share on it cannot rebuild a different coinbase. */
 	uint8_t sv2_en_prefix[SV2_MAX_B0_32];
 	uint8_t sv2_en_prefix_len;
+	/* The channel's zero pad after the prefix, also baked into coinbase1 */
+	uint16_t sv2_pad_len;
 #endif
 };
 
@@ -387,12 +389,24 @@ static void clear_unix_msg(unix_msg_t **umsg)
 	}
 }
 
-bool generator_submitblock(const char *buf)
+/* How long to keep resubmitting a block that no bitcoind answered, such as
+ * across a node restart, and the cap on the delay between attempts. */
+#define BLOCK_SUBMIT_SECS 300
+#define BLOCK_SUBMIT_MAX_DELAY 10
+
+/* Submit a solved block to the current bitcoind and, failing that, every other
+ * configured one. A block that no node answered is retried with increasing
+ * delays rather than dropped, since the whole reward depends on it. Returns 1
+ * if any node accepted it, 0 if a node answered and rejected it, and -1 if no
+ * node answered within BLOCK_SUBMIT_SECS. This blocks the calling thread for
+ * as long as it takes. */
+int generator_submitblock(const char *buf)
 {
 	gdata_t *gdata = ckpool.gdata;
+	int i, ret, delay = 1;
 	server_instance_t *si;
 	bool warn = false;
-	connsock_t *cs;
+	time_t start;
 
 	while (unlikely(!(si = gdata->current_si))) {
 		if (!warn)
@@ -400,9 +414,39 @@ bool generator_submitblock(const char *buf)
 		warn = true;
 		cksleep_ms(10);
 	}
-	cs = &si->cs;
 	LOGNOTICE("Submitting block data!");
-	return submit_block(cs, buf);
+	start = time(NULL);
+	while (42) {
+		ret = submit_block(&si->cs, buf);
+		if (ret > 0)
+			return ret;
+		for (i = 0; i < ckpool.btcds; i++) {
+			server_instance_t *other = ckpool.servers[i];
+			int oret;
+
+			if (other == si)
+				continue;
+			LOGWARNING("Submitting block data to bitcoind %s:%s",
+				   other->cs.url, other->cs.port);
+			oret = submit_block(&other->cs, buf);
+			if (oret > 0)
+				return oret;
+			if (!oret)
+				ret = 0;
+		}
+		/* A node has seen the block and judged it */
+		if (!ret)
+			return ret;
+		if (time(NULL) - start >= BLOCK_SUBMIT_SECS)
+			break;
+		LOGWARNING("No bitcoind answered block submission, retrying in %d seconds", delay);
+		sleep(delay);
+		delay = MIN(delay * 2, BLOCK_SUBMIT_MAX_DELAY);
+		/* Pick up any failover to a live server in the meantime */
+		si = gdata->current_si;
+	}
+	LOGEMERG("FAILED TO SUBMIT BLOCK: no bitcoind answered for %d seconds", BLOCK_SUBMIT_SECS);
+	return -1;
 }
 
 void generator_preciousblock(const char *hash)
@@ -528,8 +572,7 @@ retry:
 			LOGWARNING("Got too short submitblock message");
 			goto retry;
 		}
-		LOGNOTICE("Submitting block data!");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = generator_submitblock(buf + 12 + 64 + 1) > 0;
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckpool.stratifier, blockmsg);
@@ -1226,9 +1269,10 @@ static bool send_pong(proxy_instance_t *proxi, yyjson_val *val)
 static void prepare_proxy(proxy_instance_t *proxi);
 
 #ifdef HAVE_SV2
-static void sv2_proxy_free(proxy_instance_t *proxi);
+static void sv2_proxy_reset(proxy_instance_t *proxi);
 static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 				   int64_t client_id);
+static void sv2_proxy_share_solve(int proxyid, yyjson_mut_val *val);
 
 /* An upstream URL is Stratum V2 when its path carries a valid base58check pool
  * authority pubkey (spec 04 §4.7) — the presence of that key is what marks it
@@ -1362,6 +1406,10 @@ static proxy_instance_t *__subproxy_by_id(proxy_instance_t *proxy, const int sub
 /* Add to the dead list to be recycled if possible */
 static void store_proxy(gdata_t *gdata, proxy_instance_t *proxy)
 {
+#ifdef HAVE_SV2
+	struct sv2_proxy *sv2p = proxy->sv2p;
+#endif
+
 	LOGINFO("Recycling data from proxy %d:%d", proxy->id, proxy->subid);
 
 	mutex_lock(&gdata->lock);
@@ -1377,11 +1425,15 @@ static void store_proxy(gdata_t *gdata, proxy_instance_t *proxy)
 	dealloc(proxy->cs.port);
 #ifdef HAVE_SV2
 	/* Free Noise/channel/job state before the instance is zeroed. */
-	sv2_proxy_free(proxy);
+	sv2_proxy_reset(proxy);
 #endif
 	/* Drop any half-sent reference so send_json_msgq cannot UAF. */
 	proxy->sending = NULL;
 	memset(proxy, 0, sizeof(proxy_instance_t));
+#ifdef HAVE_SV2
+	/* Kept for the life of the instance, see sv2_proxy_reset() */
+	proxy->sv2p = sv2p;
+#endif
 	DL_APPEND(gdata->dead_proxies, proxy);
 	mutex_unlock(&gdata->lock);
 }
@@ -1980,11 +2032,11 @@ static void stratifier_reconnect_client(const int64_t id)
 }
 
 /* Add a share to the gdata share hashlist. Returns the share id */
-static int add_share(gdata_t *gdata, const int64_t client_id, const double diff)
+static int64_t add_share(gdata_t *gdata, const int64_t client_id, const double diff)
 {
 	share_msg_t *share = ckzalloc(sizeof(share_msg_t)), *tmpshare;
 	time_t now;
-	int ret;
+	int64_t ret;
 
 	share->submit_time = now = time(NULL);
 	share->client_id = client_id;
@@ -2008,11 +2060,12 @@ static int add_share(gdata_t *gdata, const int64_t client_id, const double diff)
 static void submit_share(gdata_t *gdata, yyjson_mut_doc *doc)
 {
 	yyjson_mut_val *val = yyjson_mut_doc_get_root(doc);
+	bool have_id __maybe_unused = false;
 	proxy_instance_t *proxy, *proxi;
-	int id, subid, share_id;
 	bool success = false;
+	int64_t client_id, share_id;
+	int id, subid;
 	stratum_msg_t *msg;
-	int64_t client_id;
 
 	/* Get the client id so we can tell the stratifier to drop it if the
 	 * proxy it's bound to is not functional */
@@ -2024,6 +2077,7 @@ static void submit_share(gdata_t *gdata, yyjson_mut_doc *doc)
 		LOGWARNING("Got no proxy in share");
 		goto out;
 	}
+	have_id = true;
 	if (unlikely(!yyjson_mut_obj_get_int(&subid, val, "subproxy"))) {
 		LOGWARNING("Got no subproxy in share");
 		goto out;
@@ -2071,8 +2125,17 @@ static void submit_share(gdata_t *gdata, yyjson_mut_doc *doc)
 	mutex_unlock(&gdata->psend_lock);
 
 out:
-	if (!success)
+	if (!success) {
+#ifdef HAVE_SV2
+		/* Only SV2 upstreams carry custom jobs, and their shares never
+		 * hand the doc on, so this sees every share that might be a
+		 * custom job block: after any upstream copy has been sent, and
+		 * even when the upstream is dead or gone. */
+		if (have_id)
+			sv2_proxy_share_solve(id, val);
+#endif
 		yyjson_mut_doc_free(doc);
+	}
 }
 
 static void clear_notify(notify_instance_t *ni)
@@ -2286,7 +2349,8 @@ static void *proxy_send(void __maybe_unused *arg)
 	pthread_detach(pthread_self());
 
 	while (42) {
-		int proxyid = 0, subid = 0, share_id = 0;
+		int proxyid = 0, subid = 0;
+		int64_t share_id = 0;
 		proxy_instance_t *proxy, *subproxy;
 		yyjson_mut_val *root, *sroot, *jobid;
 		int64_t client_id = 0, id;
@@ -2335,7 +2399,7 @@ static void *proxy_send(void __maybe_unused *arg)
 			LOGWARNING("Failed to find client_id in proxy_send msg");
 			continue;
 		}
-		yyjson_mut_obj_get_int(&share_id, sroot, "id");
+		yyjson_mut_obj_get_int64(&share_id, sroot, "id");
 		proxy = proxy_by_id(gdata, proxyid);
 		if (unlikely(!proxy)) {
 			LOGWARNING("Proxysend for got message for non-existent proxy %d",
@@ -2365,7 +2429,7 @@ static void *proxy_send(void __maybe_unused *arg)
 			continue;
 		}
 
-		root = yyjson_mut_pack_val(doc, "{s[sosss]siss}", "params", subproxy->auth,
+		root = yyjson_mut_pack_val(doc, "{s[sosss]sIss}", "params", subproxy->auth,
 				jobid,
 				yyjson_mut_get_str(yyjson_mut_obj_get(sroot, "nonce2")),
 				yyjson_mut_get_str(yyjson_mut_obj_get(sroot, "ntime")),
@@ -2514,10 +2578,13 @@ struct sv2_proxy_job {
 	uint32_t min_ntime;
 	uint8_t merkle_count;
 	uint8_t merkle_path[SV2_MAX_MERKLE_PATH][32];
-	/* coinb1 = coinbase_tx_prefix[0..cb_tx_prefix_len) ‖ extranonce_prefix */
+	/* coinb1 = coinbase_tx_prefix ‖ en_prefix ‖ pad zeros */
 	uint8_t *coinb1;
 	int coinb1len;
-	int cb_tx_prefix_len;		/* for rebuild on SetExtranoncePrefix */
+	/* The channel extranonce prefix when the job arrived: SetExtranoncePrefix
+	 * only applies to jobs sent after it (spec 5.3.10). */
+	uint8_t en_prefix[SV2_MAX_B0_32];
+	uint8_t en_prefix_len;
 	uint8_t *coinb2;		/* coinbase_tx_suffix */
 	int coinb2len;
 	/*
@@ -2550,13 +2617,15 @@ struct sv2_pending_share {
 };
 
 struct sv2_proxy {
+	/* Lives as long as the struct; everything after it is per connection
+	 * state that sv2_proxy_reset() zeroes. */
+	mutex_t send_lock;		/* serialises outbound Noise encrypt + pending map */
 	double target_diff;	/* target for future jobs, not active work */
 	sv2_noise_session_t *noise;
 	uint32_t channel_id;
 	bool channel_open;
 	uint32_t next_request_id;
 	uint32_t next_seq;		/* SubmitSharesExtended sequence */
-	mutex_t send_lock;		/* serialises outbound Noise encrypt + pending map */
 	struct sv2_pending_share *pending; /* recent submissions, including batched successes */
 	uint32_t unanswered;
 	time_t last_share_response;
@@ -2707,7 +2776,15 @@ static void sv2_proxy_job_clear(struct sv2_proxy_job *job)
 	memset(job, 0, sizeof(*job));
 }
 
-static void sv2_proxy_free(proxy_instance_t *proxi)
+#define SV2_PROXY_STATE_OFS offsetof(struct sv2_proxy, target_diff)
+
+/* Clear an SV2 proxy's connection state for a reconnect or for recycling the
+ * instance. The allocation and its send_lock are kept for the life of the
+ * proxy instance rather than freed: share submission, the JD client and
+ * stats all reach proxi->sv2p from other threads without a reference, so it
+ * must never be freed from under them. The noise session and share ledger
+ * are torn down under send_lock, the lock other threads use them under. */
+static void sv2_proxy_reset(proxy_instance_t *proxi)
 {
 	struct sv2_proxy *sp = proxi->sv2p;
 	struct sv2_pending_share *ps, *tmp;
@@ -2724,6 +2801,7 @@ static void sv2_proxy_free(proxy_instance_t *proxi)
 	 */
 	if (!proxi->subid)
 		sv2_jdc_pool_tip_clear(proxi->id);
+	mutex_lock(&sp->send_lock);
 	if (sp->noise)
 		sv2_noise_session_free(sp->noise);
 	for (i = 0; i < SV2_PROXY_JOBS; i++)
@@ -2734,10 +2812,9 @@ static void sv2_proxy_free(proxy_instance_t *proxi)
 		HASH_DEL(sp->pending, ps);
 		dealloc(ps);
 	}
-	mutex_destroy(&sp->send_lock);
 	dealloc(sp->rx);
-	dealloc(sp);
-	proxi->sv2p = NULL;
+	memset((char *)sp + SV2_PROXY_STATE_OFS, 0, sizeof(*sp) - SV2_PROXY_STATE_OFS);
+	mutex_unlock(&sp->send_lock);
 }
 
 /* Encrypt and send one plaintext SV2 message on the connection. The outbound
@@ -2757,7 +2834,8 @@ static bool sv2_proxy_send(proxy_instance_t *proxi, connsock_t *cs, uint8_t msg_
 	if (!sv2_build_frame(ext, msg_type, pay, (uint32_t)paylen, &frame, &flen))
 		goto out;
 	mutex_lock(&sp->send_lock);
-	if (sv2_noise_encrypt_frame(sp->noise, frame, flen, &ct, &ctlen))
+	/* Rechecked under the lock a reset tears the session down under */
+	if (sp->noise && sv2_noise_encrypt_frame(sp->noise, frame, flen, &ct, &ctlen))
 		ret = write_socket(cs->fd, ct, ctlen) == (int)ctlen;
 	mutex_unlock(&sp->send_lock);
 out:
@@ -3147,9 +3225,14 @@ static bool sv2_proxy_open(proxy_instance_t *proxi, connsock_t *cs)
  * OpenExtendedMiningChannel. cs->sem held by caller (proxy_alive). */
 static bool sv2_proxy_connect(proxy_instance_t *proxi, connsock_t *cs)
 {
-	sv2_proxy_free(proxi);
-	proxi->sv2p = ckzalloc(sizeof(struct sv2_proxy));
-	mutex_init(&proxi->sv2p->send_lock);
+	if (proxi->sv2p)
+		sv2_proxy_reset(proxi);
+	else {
+		struct sv2_proxy *sp = ckzalloc(sizeof(struct sv2_proxy));
+
+		mutex_init(&sp->send_lock);
+		proxi->sv2p = sp;
+	}
 	if (!sv2_proxy_handshake(proxi, cs))
 		goto fail;
 	if (!sv2_proxy_setup(proxi, cs))
@@ -3158,7 +3241,7 @@ static bool sv2_proxy_connect(proxy_instance_t *proxi, connsock_t *cs)
 		goto fail;
 	return true;
 fail:
-	sv2_proxy_free(proxi);
+	sv2_proxy_reset(proxi);
 	return false;
 }
 
@@ -3291,7 +3374,8 @@ bool sv2_proxy_set_custom_job(const struct sv2_jdc_custom_job *cj)
 	stage.merkle_count = (uint8_t)t->merkles;
 	for (i = 0; i < t->merkles; i++)
 		memcpy(stage.merkle_path[i], t->merkle_path[i], 32);
-	stage.cb_tx_prefix_len = cj->lcb_prefix_len;
+	stage.en_prefix_len = eplen;
+	memcpy(stage.en_prefix, sp->extranonce_prefix, eplen);
 	stage.coinb1len = cj->lcb_prefix_len + eplen + sp->pad_len;
 	stage.coinb1 = ckalloc(stage.coinb1len);
 	memcpy(stage.coinb1, cj->lcb_prefix, cj->lcb_prefix_len);
@@ -3528,9 +3612,9 @@ static void sv2_proxy_send_job(proxy_instance_t *proxi, struct sv2_proxy_job *jo
 		ni->sv2_dcb_suffix_len = job->dcb_suffix_len;
 		ni->sv2_dcb_suffix = ckalloc(job->dcb_suffix_len);
 		memcpy(ni->sv2_dcb_suffix, job->dcb_suffix, job->dcb_suffix_len);
-		ni->sv2_en_prefix_len = sp->extranonce_prefix_len;
-		memcpy(ni->sv2_en_prefix, sp->extranonce_prefix,
-		       sp->extranonce_prefix_len);
+		ni->sv2_en_prefix_len = job->en_prefix_len;
+		memcpy(ni->sv2_en_prefix, job->en_prefix, job->en_prefix_len);
+		ni->sv2_pad_len = sp->pad_len;
 	}
 
 	mutex_lock(&gdata->notify_lock);
@@ -3561,23 +3645,27 @@ static void sv2_proxy_send_job(proxy_instance_t *proxi, struct sv2_proxy_job *jo
  * and aged out ten minutes later, so it is safe to read here on the share thread
  * — unlike the job ring, which the receive thread rotates.
  */
-static void sv2_proxy_custom_solve(proxy_instance_t *proxi, int64_t notify_id,
-				   const uint8_t *full_en, uint8_t full_len,
-				   const uint8_t *en2, int en2len, uint32_t version,
-				   uint32_t ntime, uint32_t nonce)
+static void sv2_proxy_custom_solve(int proxyid, int64_t notify_id, const char *nonce2,
+				   uint32_t version_mask, uint32_t ntime, uint32_t nonce)
 {
 	uint8_t coinbase[1024], merkle[64], root[32], header[80], hash[32];
-	uint8_t prevbin[32], flip[32];
+	uint8_t prevbin[32], flip[32], en2[32], full_en[SV2_MAX_B0_32];
+	uint32_t nbits = 0, version = 0;
 	struct sv2_jdc_solution sol;
 	gdata_t *gdata = ckpool.gdata;
 	double sdiff = 0, netdiff = 0;
+	size_t cblen, dcblen, full_len;
 	notify_instance_t *ni;
-	size_t cblen, dcblen;
 	uint8_t *dcb = NULL;
-	uint32_t nbits = 0;
+	int c1, c2, i, en2len;
 	char hex[68];
 	uint32_t le;
-	int c1, c2, i;
+
+	/* Stratifier packs en1var‖en2 as "nonce2" */
+	en2len = strlen(nonce2) / 2;
+	if (en2len < 1 || en2len > (int)sizeof(en2) || !validhex(nonce2))
+		return;
+	hex2bin(en2, nonce2, en2len);
 
 	memset(&sol, 0, sizeof(sol));
 	mutex_lock(&gdata->notify_lock);
@@ -3587,11 +3675,21 @@ static void sv2_proxy_custom_solve(proxy_instance_t *proxi, int64_t notify_id,
 	c1 = ni->coinb1len;
 	c2 = strlen(ni->coinbase2) / 2;
 	cblen = (size_t)c1 + en2len + c2;
-	if (cblen > sizeof(coinbase) || c1 < 1 || en2len < 1) {
+	/* The whole coinbase hole as the pool and our own node see it: the
+	 * prefix this job was built with, its zero pad, then what was mined. */
+	full_len = (size_t)ni->sv2_en_prefix_len + ni->sv2_pad_len + en2len;
+	if (cblen > sizeof(coinbase) || c1 < 1 || full_len > sizeof(full_en)) {
 		LOGWARNING("SV2 proxy %d custom coinbase %zu bytes unrebuildable",
-			   proxi->id, cblen);
+			   proxyid, cblen);
 		goto unlock;
 	}
+	memcpy(full_en, ni->sv2_en_prefix, ni->sv2_en_prefix_len);
+	memset(full_en + ni->sv2_en_prefix_len, 0, ni->sv2_pad_len);
+	memcpy(full_en + ni->sv2_en_prefix_len + ni->sv2_pad_len, en2, en2len);
+	/* Full nVersion = job base version with the miner's BIP320 bits OR'd
+	 * in, matching how the stratifier built the header it validated. */
+	sscanf(ni->bbversion, "%x", &version);
+	version |= version_mask;
 	/* coinb1 already carries the channel prefix and pad, so the miner's
 	 * enonce1var ‖ enonce2 completes the hole. */
 	hex2bin(coinbase, ni->coinbase1, c1);
@@ -3651,7 +3749,7 @@ static void sv2_proxy_custom_solve(proxy_instance_t *proxi, int64_t notify_id,
 	sol.coinbase = dcb;
 	sol.coinbase_len = dcblen;
 	sol.extranonce = full_en;
-	sol.extranonce_len = full_len;
+	sol.extranonce_len = (uint8_t)full_len;
 	memcpy(sol.prev_hash, header + 4, 32);
 	sol.version = version;
 	sol.ntime = ntime;
@@ -3666,7 +3764,7 @@ unlock:
 	flip_32(flip, hash);
 	__bin2hex(hex, flip, 32);
 	LOGWARNING("SV2 proxy %d custom block solve! diff %.1f of %.1f hash %s",
-		   proxi->id, sdiff, netdiff, hex);
+		   proxyid, sdiff, netdiff, hex);
 	sv2_jdc_solved(&sol);
 	sv2_jdc_template_put(sol.t);
 	dealloc(dcb);
@@ -3684,10 +3782,7 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	struct sv2_submit_shares_extended sub;
 	const char *nonce2, *ntime_s, *nonce_s;
 	uint32_t version_mask = 0, base_version = 0, upstream_job = 0, seq;
-	uint8_t full_en[SV2_MAX_B0_32];
 	uint8_t nonce2bin[32];
-	uint8_t full_len = 0, ep[SV2_MAX_B0_32], eplen = 0;
-	bool custom = false;
 	double job_diff = 0;
 	int64_t jobid = 0;
 	uint8_t pbuf[128];
@@ -3714,9 +3809,6 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 		upstream_job = (uint32_t)yyjson_mut_get_uint(yyjson_mut_doc_get_root(ni->jobid));
 		sscanf(ni->bbversion, "%x", &base_version);
 		job_diff = ni->sv2_diff;
-		custom = ni->sv2_custom;
-		eplen = ni->sv2_en_prefix_len;
-		memcpy(ep, ni->sv2_en_prefix, eplen);
 	}
 	mutex_unlock(&gdata->notify_lock);
 	if (!ni) {
@@ -3747,17 +3839,6 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 		hex2bin(nonce2bin, nonce2, en_len);
 		memcpy(sub.extranonce + padlen, nonce2bin, en_len);
 		sub.extranonce_len = (uint8_t)total;
-		/*
-		 * The whole coinbase hole as the pool and our own node see it:
-		 * the prefix this job was built with, then what was submitted.
-		 * Only the solve path needs it, but it is only assembled here.
-		 */
-		if (custom && (size_t)eplen + total <= sizeof(full_en)) {
-			memcpy(full_en, ep, eplen);
-			memcpy(full_en + eplen, sub.extranonce, total);
-			full_len = (uint8_t)(eplen + total);
-		} else
-			custom = false;
 	}
 	sub.base.channel_id = sp->channel_id;
 	mutex_lock(&sp->send_lock);
@@ -3794,13 +3875,91 @@ static void sv2_proxy_submit_share(proxy_instance_t *proxi, yyjson_mut_val *val,
 	}
 	LOGINFO("SV2 proxy %d submitted share seq %u job %u ver %08x", proxi->id,
 		seq, upstream_job, sub.base.version);
+}
 
-	/* Upstream has its copy; now see whether it was a block. */
-	if (custom) {
-		sv2_proxy_custom_solve(proxi, jobid, full_en, full_len, nonce2bin,
-				       en_len, sub.base.version, sub.base.ntime,
-				       sub.base.nonce);
+/* A share on a custom (job declaration) job may be a block, which we submit
+ * through our own node and the JDS regardless of the state of the upstream
+ * connection, so this must be reached even when the share could not be sent
+ * upstream. */
+static void sv2_proxy_share_solve(int proxyid, yyjson_mut_val *val)
+{
+	const char *nonce2, *ntime_s, *nonce_s;
+	uint32_t version_mask = 0;
+	int64_t jobid = 0;
+
+	if (!yyjson_mut_obj_get_int64(&jobid, val, "jobid"))
+		return;
+	nonce2 = yyjson_mut_get_str(yyjson_mut_obj_get(val, "nonce2"));
+	ntime_s = yyjson_mut_get_str(yyjson_mut_obj_get(val, "ntime"));
+	nonce_s = yyjson_mut_get_str(yyjson_mut_obj_get(val, "nonce"));
+	yyjson_mut_obj_get_uint32(&version_mask, val, "version_mask");
+	if (!nonce2 || !ntime_s || !nonce_s)
+		return;
+	sv2_proxy_custom_solve(proxyid, jobid, nonce2, version_mask,
+			       strtoul(ntime_s, NULL, 16), strtoul(nonce_s, NULL, 16));
+}
+
+/* Store an upstream extended job against the channel's current prefix. */
+static struct sv2_proxy_job *sv2_proxy_store_job(struct sv2_proxy *sp,
+						 const struct sv2_new_extended_mining_job *j)
+{
+	struct sv2_proxy_job *job = sv2_proxy_job_slot(sp, j->job_id);
+	int i;
+
+	job->diff = sp->target_diff;
+	job->future = !j->min_ntime_present;
+	job->min_ntime = j->min_ntime;
+	job->version = j->version;
+	job->merkle_count = j->merkle_count;
+	for (i = 0; i < j->merkle_count; i++)
+		memcpy(job->merkle_path[i], j->merkle_path[i], 32);
+	/* coinb1 = coinbase_tx_prefix ‖ extranonce_prefix ‖ pad zeros.
+	 * The pad fills the channel extranonce hole up to extranonce_size
+	 * so miners hash the exact U-byte layout the pool reconstructs. */
+	job->en_prefix_len = sp->extranonce_prefix_len;
+	memcpy(job->en_prefix, sp->extranonce_prefix, sp->extranonce_prefix_len);
+	job->coinb1len = j->coinbase_tx_prefix_len + sp->extranonce_prefix_len +
+			 sp->pad_len;
+	job->coinb1 = ckalloc(job->coinb1len ? job->coinb1len : 1);
+	memcpy(job->coinb1, j->coinbase_tx_prefix, j->coinbase_tx_prefix_len);
+	memcpy(job->coinb1 + j->coinbase_tx_prefix_len, sp->extranonce_prefix,
+	       sp->extranonce_prefix_len);
+	if (sp->pad_len)
+		memset(job->coinb1 + j->coinbase_tx_prefix_len +
+		       sp->extranonce_prefix_len, 0, sp->pad_len);
+	job->coinb2len = j->coinbase_tx_suffix_len;
+	job->coinb2 = ckalloc(job->coinb2len ? job->coinb2len : 1);
+	memcpy(job->coinb2, j->coinbase_tx_suffix, j->coinbase_tx_suffix_len);
+	return job;
+}
+
+/*
+ * Spec 5.3.10: a new prefix applies to jobs sent after it. Jobs already stored
+ * keep the prefix they were built with, which is what the pool reconstructs
+ * them with, so they stay minable and nothing downstream needs flushing.
+ * Returns true if an in-flight SetCustomMiningJob had to be dropped.
+ */
+static bool sv2_proxy_new_prefix(struct sv2_proxy *sp,
+				 const struct sv2_set_extranonce_prefix *e)
+{
+	struct sv2_proxy_job dropped = {};
+	bool had_pending = false;
+
+	memcpy(sp->extranonce_prefix, e->extranonce_prefix, e->extranonce_prefix_len);
+	sp->extranonce_prefix_len = e->extranonce_prefix_len;
+	/* A SetCustomMiningJob still in flight was built on the old prefix but
+	 * the pool will apply the new one to it, so its Success would install
+	 * work whose coinbase the pool reconstructs differently. */
+	mutex_lock(&sp->send_lock);
+	if (sp->custom_pending) {
+		sp->custom_pending = false;
+		dropped = sp->custom_stage;
+		memset(&sp->custom_stage, 0, sizeof(sp->custom_stage));
+		had_pending = true;
 	}
+	mutex_unlock(&sp->send_lock);
+	sv2_proxy_job_clear(&dropped);
+	return had_pending;
 }
 
 /* Dispatch one decrypted server→client frame, translating the SV2 mining flow
@@ -3824,7 +3983,6 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 	case SV2_MSG_NEW_EXTENDED_MINING_JOB: {
 		struct sv2_new_extended_mining_job j;
 		struct sv2_proxy_job *job;
-		int i;
 
 		if (!sv2_decode_new_extended_mining_job(pay, pl, &j))
 			break;
@@ -3839,30 +3997,7 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 			sv2_new_extended_mining_job_free(&j);
 			break;
 		}
-		job = sv2_proxy_job_slot(sp, j.job_id);
-		job->diff = sp->target_diff;
-		job->future = !j.min_ntime_present;
-		job->min_ntime = j.min_ntime;
-		job->version = j.version;
-		job->merkle_count = j.merkle_count;
-		for (i = 0; i < j.merkle_count; i++)
-			memcpy(job->merkle_path[i], j.merkle_path[i], 32);
-		/* coinb1 = coinbase_tx_prefix ‖ extranonce_prefix ‖ pad zeros.
-		 * The pad fills the channel extranonce hole up to extranonce_size
-		 * so miners hash the exact U-byte layout the pool reconstructs. */
-		job->cb_tx_prefix_len = j.coinbase_tx_prefix_len;
-		job->coinb1len = j.coinbase_tx_prefix_len + sp->extranonce_prefix_len +
-				 sp->pad_len;
-		job->coinb1 = ckalloc(job->coinb1len ? job->coinb1len : 1);
-		memcpy(job->coinb1, j.coinbase_tx_prefix, j.coinbase_tx_prefix_len);
-		memcpy(job->coinb1 + j.coinbase_tx_prefix_len, sp->extranonce_prefix,
-		       sp->extranonce_prefix_len);
-		if (sp->pad_len)
-			memset(job->coinb1 + j.coinbase_tx_prefix_len +
-			       sp->extranonce_prefix_len, 0, sp->pad_len);
-		job->coinb2len = j.coinbase_tx_suffix_len;
-		job->coinb2 = ckalloc(job->coinb2len ? job->coinb2len : 1);
-		memcpy(job->coinb2, j.coinbase_tx_suffix, j.coinbase_tx_suffix_len);
+		job = sv2_proxy_store_job(sp, &j);
 		sv2_new_extended_mining_job_free(&j);
 		LOGINFO("SV2 proxy %d stored job %u future=%d merkles=%u",
 			proxi->id, job->job_id, job->future, job->merkle_count);
@@ -4052,82 +4187,13 @@ static void sv2_proxy_handle_frame(proxy_instance_t *proxi, const uint8_t *frame
 	}
 	case SV2_MSG_SET_EXTRANONCE_PREFIX: {
 		struct sv2_set_extranonce_prefix e;
-		struct sv2_proxy_job dropped = {};
-		bool had_custom = false;
-		int ji;
 
 		if (!sv2_decode_set_extranonce_prefix(pay, pl, &e))
 			break;
-		memcpy(sp->extranonce_prefix, e.extranonce_prefix,
-		       e.extranonce_prefix_len);
-		sp->extranonce_prefix_len = e.extranonce_prefix_len;
-		LOGNOTICE("SV2 proxy %d SetExtranoncePrefix len=%u — rebuild + clean notify",
+		LOGNOTICE("SV2 proxy %d SetExtranoncePrefix len=%u for subsequent jobs",
 			  proxi->id, e.extranonce_prefix_len);
-		/* All stored jobs embed the old prefix in coinb1; rebuild. */
-		for (ji = 0; ji < SV2_PROXY_JOBS; ji++) {
-			struct sv2_proxy_job *job = &sp->jobs[ji];
-			uint8_t *ncoinb1;
-			int nlen;
-
-			/*
-			 * A custom job cannot be rebuilt this way: its coinbase hole
-			 * is what the JDS accepted and what both the pool's block
-			 * rebuild and our PushSolution assume, so a new prefix — even
-			 * one of the same length — makes it unmineable. Drop it and
-			 * have the template declared again for the new layout.
-			 */
-			if (job->custom) {
-				if (job->valid)
-					had_custom = true;
-				sv2_proxy_job_clear(job);
-				continue;
-			}
-			if (!job->valid || !job->coinb1 || job->cb_tx_prefix_len < 0 ||
-			    job->cb_tx_prefix_len > job->coinb1len)
-				continue;
-			nlen = job->cb_tx_prefix_len + sp->extranonce_prefix_len +
-			       sp->pad_len;
-			ncoinb1 = ckalloc(nlen ? nlen : 1);
-			memcpy(ncoinb1, job->coinb1, job->cb_tx_prefix_len);
-			memcpy(ncoinb1 + job->cb_tx_prefix_len, sp->extranonce_prefix,
-			       sp->extranonce_prefix_len);
-			if (sp->pad_len)
-				memset(ncoinb1 + job->cb_tx_prefix_len +
-				       sp->extranonce_prefix_len, 0, sp->pad_len);
-			dealloc(job->coinb1);
-			job->coinb1 = ncoinb1;
-			job->coinb1len = nlen;
-		}
-		/* Flush newest minable job so downstream adopts the prefix. */
-		if (sp->have_prevhash) {
-			for (ji = 0; ji < SV2_PROXY_JOBS; ji++) {
-				int idx = (sp->job_head - 1 - ji + SV2_PROXY_JOBS) %
-					  SV2_PROXY_JOBS;
-				struct sv2_proxy_job *job = &sp->jobs[idx];
-
-				if (job->valid && !job->future && job->coinb1) {
-					sv2_proxy_send_job(proxi, job, true);
-					break;
-				}
-			}
-		}
-		/* A SetCustomMiningJob still in flight was built on the old hole, so
-		 * its Success would install work nobody can mine. */
-		mutex_lock(&sp->send_lock);
-		if (sp->custom_pending) {
-			sp->custom_pending = false;
-			dropped = sp->custom_stage;
-			memset(&sp->custom_stage, 0, sizeof(sp->custom_stage));
-			had_custom = true;
-		}
-		mutex_unlock(&sp->send_lock);
-		sv2_proxy_job_clear(&dropped);
-		if (had_custom) {
-			sp->have_custom_prev = false;
-			sv2_proxy_work_src(proxi, SV2_WS_POOL,
-					   "custom work dropped for a new extranonce prefix");
+		if (sv2_proxy_new_prefix(sp, &e))
 			sv2_jdc_custom_dropped("SetExtranoncePrefix");
-		}
 		break;
 	}
 	case SV2_MSG_SUBMIT_SHARES_SUCCESS: {
@@ -5175,8 +5241,10 @@ static void delete_proxy(gdata_t *gdata, proxy_instance_t *proxy)
 	/* Remove the proxy from the master list first */
 	mutex_lock(&gdata->lock);
 	HASH_DEL(gdata->proxies, proxy);
-	/* Disable all its threads */
-	pthread_cancel(proxy->pth_precv);
+	/* Disable all its threads. A userproxy added without one, being non
+	 * global, has a zeroed pth_precv that must not be cancelled. */
+	if (proxy->pth_precv)
+		pthread_cancel(proxy->pth_precv);
 	close_proxy_socket(proxy, proxy);
 	mutex_unlock(&gdata->lock);
 
@@ -5627,7 +5695,7 @@ retry:
 			goto retry;
 		}
 		LOGNOTICE("Submitting likely block solve share from upstream pool");
-		ret = submit_block(cs, buf + 12 + 64 + 1);
+		ret = submit_block(cs, buf + 12 + 64 + 1) > 0;
 		memset(buf + 12 + 64, 0, 1);
 		sprintf(blockmsg, "%sblock:%s", ret ? "" : "no", buf + 12);
 		send_proc(ckpool.stratifier, blockmsg);
@@ -5786,19 +5854,27 @@ static void proxy_mode(proc_instance_t *pi)
 	sv2_jdc_start();
 #endif
 
+	/* Initialise the shared psend mutex and conditional once, before any
+	 * thread that may use them is launched. */
+	if (!ckpool.passthrough) {
+		mutex_init(&gdata->psend_lock);
+		cond_init(&gdata->psend_cond);
+	}
+
 	/* Create all our proxy structures and pointers */
 	for (i = 0; i < ckpool.proxies; i++) {
 		proxy = __add_proxy(gdata, i);
 		if (ckpool.passthrough) {
 			create_pthread(&proxy->pth_precv, passthrough_recv, proxy);
 			proxy->passsends = create_ckmsgq("passsend", &passthrough_send);
-		} else {
-			mutex_init(&gdata->psend_lock);
-			cond_init(&gdata->psend_cond);
+		} else
 			prepare_proxy(proxy);
-			create_pthread(&gdata->pth_uprecv, userproxy_recv, NULL);
-			create_pthread(&gdata->pth_psend, proxy_send, NULL);
-		}
+	}
+
+	/* One userproxy receiver and one proxy sender serve every proxy */
+	if (!ckpool.passthrough) {
+		create_pthread(&gdata->pth_uprecv, userproxy_recv, NULL);
+		create_pthread(&gdata->pth_psend, proxy_send, NULL);
 	}
 
 	proxy_loop(pi);

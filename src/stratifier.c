@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
@@ -42,6 +43,7 @@
 #ifdef HAVE_SV2
 #include "sv2_strat.h"
 #include "sv2_jd.h"
+#include "sv2_tx.h"
 #endif
 
 /* Consistent across all pool instances */
@@ -903,21 +905,27 @@ static void clear_workbase(workbase_t *wb)
 	free(wb);
 }
 
-/* Remove all shares with a workbase id less than wb_id for block changes */
-static void purge_share_hashtable(sdata_t *sdata, const int64_t wb_id)
+/* Remove all shares whose workbase has been discarded on block changes. Shares
+ * of workbases that still exist are kept, as those can still be submitted
+ * as stale shares and must still be detected as duplicates. */
+static void purge_share_hashtable(sdata_t *sdata)
 {
 	share_t *share, *tmp;
+	workbase_t *wb;
 	int purged = 0;
 
+	ck_rlock(&sdata->workbase_lock);
 	mutex_lock(&sdata->share_lock);
 	HASH_ITER(hh, sdata->shares, share, tmp) {
-		if (share->workbase_id < wb_id) {
+		HASH_FIND_I64(sdata->workbases, &share->workbase_id, wb);
+		if (!wb) {
 			HASH_DEL(sdata->shares, share);
 			dealloc(share);
 			purged++;
 		}
 	}
 	mutex_unlock(&sdata->share_lock);
+	ck_runlock(&sdata->workbase_lock);
 
 	if (purged)
 		LOGINFO("Cleared %d shares from share hashtable", purged);
@@ -1130,13 +1138,23 @@ static void __generate_userwb(sdata_t *sdata, workbase_t *wb, user_instance_t *u
 	HASH_ADD_I64(user->userwbs, id, userwb);
 }
 
+/* How long after its last share a user with no clients keeps getting user
+ * workbases, covering miners briefly reconnecting. */
+#define USERWB_IDLE_SECS 600
+
 static void generate_userwbs(sdata_t *sdata, workbase_t *wb)
 {
 	user_instance_t *instance, *tmp;
+	time_t now_t = time(NULL);
 
 	ck_wlock(&sdata->instance_lock);
 	HASH_ITER(hh, sdata->user_instances, instance, tmp) {
 		if (!instance->btcaddress)
+			continue;
+		/* Every user ever seen would otherwise cost a coinbase on every
+		 * template; an authorising client gets the current one made
+		 * for it. */
+		if (!instance->clients && now_t - instance->last_share.tv_sec > USERWB_IDLE_SECS)
 			continue;
 		__generate_userwb(sdata, wb, instance);
 	}
@@ -1257,13 +1275,25 @@ static void add_base(sdata_t *sdata, workbase_t *wb, bool *new_block)
 	}
 	ck_wunlock(&sdata->workbase_lock);
 
+	/* Log the workinfo alongside its sharelog outside of the lock */
+	if (ckpool.logshares) {
+		yyjson_mut_doc *wi_doc = generate_workinfo(wb, __func__);
+		char *wifname;
+
+		ASPRINTF(&wifname, "%s.workinfo", wb->logdir);
+		if (unlikely(!yyjson_mut_write_file(wifname, wi_doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL)))
+			LOGERR("Failed to write to %s", wifname);
+		yyjson_mut_doc_free(wi_doc);
+		dealloc(wifname);
+	}
+
 	/* This wb can't be pulled out from under us so no workbase lock is
 	 * required to generate_userwbs */
 	if (ckpool.btcsolo)
 		generate_userwbs(sdata, wb);
 
 	if (*new_block)
-		purge_share_hashtable(sdata, wb->id);
+		purge_share_hashtable(sdata);
 
 	if (!ckpool.passthrough)
 		send_workinfo(sdata, wb);
@@ -1820,7 +1850,14 @@ retry:
 		wb = generator_getbase();
 		if (unlikely(!wb)) {
 			if (retries++ < 5 || *prio == GEN_PRIORITY) {
-				LOGWARNING("Generator returned failure in update_base, retry #%d", retries);
+				/* A priority update retries until bitcoind is back,
+				 * so beyond the first few immediate retries pace it,
+				 * as every failure also queues a generator reconnect,
+				 * and rate limit the warning. */
+				if (retries <= 5 || !(retries % 50))
+					LOGWARNING("Generator returned failure in update_base, retry #%d", retries);
+				if (retries > 5)
+					cksleep_ms(100);
 				goto retry;
 			}
 			LOGWARNING("Generator failed in update_base after retrying");
@@ -2453,12 +2490,34 @@ process_block(const workbase_t *wb, const char *coinbase, const int cblen,
 	return gbt_block;
 }
 
+/* Keep a block that no bitcoind could be reached to submit, so it can still
+ * be submitted by hand with bitcoin-cli submitblock once a node is back. */
+static void save_unsubmitted_block(const char *gbt_block, const char *rhash, int height)
+{
+	char *fname;
+	FILE *fp;
+
+	ASPRINTF(&fname, "%sblock-%d-%s.hex", ckpool.logdir, height, rhash);
+	fp = fopen(fname, "we");
+	if (unlikely(!fp)) {
+		LOGEMERG("Failed to open %s to save unsubmitted block %d %s", fname, height, rhash);
+		goto out;
+	}
+	if (unlikely(fprintf(fp, "%s\n", gbt_block) < 0 || fclose(fp)))
+		LOGEMERG("Failed to write unsubmitted block to %s", fname);
+	else
+		LOGWARNING("Saved unsubmitted block %d %s to %s", height, rhash, fname);
+out:
+	free(fname);
+}
+
 /* Submit block data locally, absorbing and freeing gbt_block */
 static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 {
-	bool ret = generator_submitblock(gbt_block);
 	char heighthash[68] = {}, rhash[68] = {};
 	uchar swap256[32];
+	int submitted;
+	bool ret;
 
 	free(gbt_block);
 
@@ -2471,6 +2530,11 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 
 	swap_256(swap256, flip32);
 	__bin2hex(rhash, swap256, 32);
+	submitted = generator_submitblock(gbt_block);
+	if (unlikely(submitted < 0))
+		save_unsubmitted_block(gbt_block, rhash, height);
+	ret = submitted > 0;
+	free(gbt_block);
 	generator_preciousblock(rhash);
 
 	/* Check failures that may be inconclusive but were submitted via other
@@ -4017,6 +4081,8 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 	int64_t pass_id;
 
 	client = __recruit_stratum_instance(sdata);
+	/* SV1 and SV2 clients are added from different threads */
+	client->session_id = ++sdata->session_id;
 	ck_wunlock(&sdata->instance_lock);
 
 	/* Fake a share time at startup to prevent client being dropped for
@@ -4024,7 +4090,6 @@ static stratum_instance_t *__stratum_add_instance(int64_t id, const char *addres
 	client->start_time = client->last_share.tv_sec = time(NULL);
 
 	client->id = id;
-	client->session_id = ++sdata->session_id;
 	snprintf(client->address, sizeof(client->address), "%s", address);
 	/* Sanity check to not overflow lookup in ckpool.serverurl[]. A negative
 	 * index would read before the allocation in the trusted[]/nodeserver[]
@@ -6095,8 +6160,11 @@ static void read_userstats(sdata_t *sdata, int tvsec_diff)
 		LOGINFO("Successfully read user %s stats %f %f %f %f %f %f %ld %ld", user->username,
 			user->dsps1, user->dsps5, user->dsps60, user->dsps1440,
 			user->dsps10080, user->best_diff, user->best_ever, user->auth_time);
-		if (tvsec_diff > 60)
+		/* Stats were last decayed when the pool went down */
+		if (tvsec_diff > 60) {
+			user->last_decay.tv_sec -= tvsec_diff;
 			decay_user(user, 0, &now);
+		}
 
 		worker_array = yyjson_obj_get(val, "worker");
 		yyjson_arr_iter_init(worker_array, &iter);
@@ -6131,8 +6199,10 @@ static void read_userstats(sdata_t *sdata, int tvsec_diff)
 			yyjson_obj_get_int64(&worker->shares, arr_val, "shares");
 			LOGINFO("Successfully read worker %s stats %f %f %f %f %f %ld", worker->workername,
 				worker->dsps1, worker->dsps5, worker->dsps60, worker->dsps1440, worker->best_diff, worker->best_ever);
-			if (tvsec_diff > 60)
+			if (tvsec_diff > 60) {
+				worker->last_decay.tv_sec -= tvsec_diff;
 				decay_worker(worker, 0, &now);
+			}
 		}
 		yyjson_doc_free(doc);
 	}
@@ -6257,14 +6327,72 @@ static worker_instance_t *get_worker(sdata_t *sdata, user_instance_t *user, cons
 	return get_create_worker(sdata, user, workername, &dummy);
 }
 
+/* Publish username's payout script on user. The script is complete before
+ * btcaddress is set, both under instance_lock, so a userwb generated
+ * concurrently can never see btcaddress with an empty or partial script. */
+static bool user_publish_address(sdata_t *sdata, user_instance_t *user, const char *username,
+				 const bool script, const bool segwit)
+{
+	char txnbin[sizeof(user->txnbin)];
+	int txnlen;
+
+	txnlen = address_to_txn(txnbin, username, script, segwit);
+	if (unlikely(txnlen < 1))
+		return false;
+	ck_wlock(&sdata->instance_lock);
+	user->script = script;
+	user->segwit = segwit;
+	memcpy(user->txnbin, txnbin, txnlen);
+	user->txnlen = txnlen;
+	user->btcaddress = true;
+	ck_wunlock(&sdata->instance_lock);
+	return true;
+}
+
+/* Is this a btc address based username? Publish its payout script if so. */
+static bool user_check_address(sdata_t *sdata, user_instance_t *user, const char *username)
+{
+	bool script = false, segwit = false;
+
+	if (!generator_checkaddr(username, &script, &segwit))
+		return false;
+	return user_publish_address(sdata, user, username, script, segwit);
+}
+
+/* Cheap local filter for usernames that cannot be any bitcoin address on any
+ * network, base58 or bech32, to spare bitcoind a validateaddress call. */
+static bool address_plausible(const char *username)
+{
+	size_t len = strlen(username), i;
+
+	if (len < 25 || len > 90)
+		return false;
+	for (i = 0; i < len; i++) {
+		if (!isalnum((unsigned char)username[i]))
+			return false;
+	}
+	return true;
+}
+
+static bool user_exists(sdata_t *sdata, const char *username)
+{
+	user_instance_t *user;
+
+	ck_rlock(&sdata->instance_lock);
+	HASH_FIND_STR(sdata->user_instances, username, user);
+	ck_runlock(&sdata->instance_lock);
+	return user != NULL;
+}
+
 /* This simply strips off the first part of the workername and matches it to a
  * user or creates a new one. Needs to be entered with client holding a ref
- * count. */
+ * count. Returns NULL with *why set if no user can be had. */
 static user_instance_t *generate_user(stratum_instance_t *client,
-				      const char *workername)
+				      const char *workername, const char **why)
 {
 	char *base_username, *username;
-	bool new_user = false, new_worker = false;
+	bool new_user = false, new_worker = false, checked = false;
+	bool script = false, segwit = false;
 	sdata_t *sdata = ckpool.sdata;
 	worker_instance_t *worker;
 	user_instance_t *user;
@@ -6272,18 +6400,36 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 
 	/* Callers normally validate at the protocol boundary. Keep this safe
 	 * for every caller, before strdupa/strsep can see an empty identity. */
-	if (unlikely(workername_error(workername)))
+	if (unlikely(workername_error(workername))) {
+		*why = "Invalid username";
 		return NULL;
+	}
 	base_username = strdupa(workername);
 	username = strsep(&base_username, "._");
 	len = strlen(username);
 	if (unlikely(len > 127))
 		username[127] = '\0';
 
+	/* A solo username that is not an address can never authorise, so
+	 * check it before it gets a permanent user record and a slot counted
+	 * against maxusers. */
+	if (ckpool.btcsolo && !user_exists(sdata, username)) {
+		if (!address_plausible(username) ||
+		    !generator_checkaddr(username, &script, &segwit)) {
+			LOGINFO("Client %s %s rejected invalid address username %s",
+				client->identity, client->address, username);
+			*why = "Invalid bitcoin address";
+			return NULL;
+		}
+		checked = true;
+	}
+
 	/* Limited: this is reached directly from mining.authorize. */
 	user = __get_create_user(sdata, username, &new_user, true);
-	if (unlikely(!user))
+	if (unlikely(!user)) {
+		*why = "Pool user limit reached";
 		return NULL;
+	}
 	worker = get_create_worker(sdata, user, workername, &new_worker);
 
 	/* Create one worker instance for combined data from workers of the
@@ -6296,11 +6442,18 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	ck_wunlock(&sdata->instance_lock);
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
+<<<<<<< HEAD
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
 			user->btcaddress = true;
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckpool.ecash);
 		}
+=======
+		if (checked)
+			user_publish_address(sdata, user, username, script, segwit);
+		else
+			user_check_address(sdata, user, username);
+>>>>>>> upstream/master
 	}
 	if (new_user) {
 		LOGNOTICE("Added new user %s%s", username, user->btcaddress ?
@@ -6314,9 +6467,16 @@ static void check_global_user(user_instance_t *user, stratum_instance_t *client)
 {
 	sdata_t *sdata = ckpool.sdata;
 	proxy_t *proxy = best_proxy(sdata);
-	int proxyid = proxy->id;
 	char buf[256];
+	int proxyid;
 
+	/* All global proxies may be dead during an upstream outage */
+	if (unlikely(!proxy)) {
+		LOGNOTICE("No global proxy to add user %s to for client %s",
+			  user->username, client->identity);
+		return;
+	}
+	proxyid = proxy->id;
 	sprintf(buf, "globaluser=%d:%d:%"PRId64":%s,%s", proxyid, user->id, client->id,
 		user->username, client->password);
 	send_proc(ckpool.generator,buf);
@@ -6371,17 +6531,23 @@ static yyjson_mut_doc *__user_notify(const workbase_t *wb, const user_instance_t
 static void update_solo_client(sdata_t *sdata, workbase_t *wb, const int64_t client_id,
 				 user_instance_t *user_instance)
 {
-	yyjson_mut_doc *doc = __user_notify(wb, user_instance, true);
+	yyjson_mut_doc *doc;
 
-	stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
+	/* userwbs are added and deleted under instance_lock */
+	ck_rlock(&sdata->instance_lock);
+	doc = __user_notify(wb, user_instance, true);
+	ck_runlock(&sdata->instance_lock);
+
+	if (likely(doc))
+		stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
 }
 
 /* Needs to be entered with client holding a ref count. */
 static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_val,
 			    yyjson_mut_doc **err_doc)
 {
+	const char *buf, *pass, *name_error, *user_error = NULL;
 	user_instance_t *user;
-	const char *buf, *pass, *name_error;
 	bool ret = false;
 	int arr_size;
 	ts_t now;
@@ -6406,9 +6572,9 @@ static bool parse_authorise(stratum_instance_t *client, yyjson_mut_val *params_v
 		goto out;
 	}
 	pass = yyjson_mut_get_str(yyjson_mut_arr_get(params_val, 1));
-	user = generate_user(client, buf);
+	user = generate_user(client, buf, &user_error);
 	if (unlikely(!user)) {
-		*err_doc = yyjson_string("Pool user limit reached");
+		*err_doc = yyjson_string(user_error);
 		client->dropped = true;
 		goto out;
 	}
@@ -6538,9 +6704,11 @@ static void account_client_share(pool_stats_t *stats, stratum_instance_t *client
 	}
 }
 
-/* Needs to be entered with client holding a ref count. */
+/* Needs to be entered with client holding a ref count. Rejects are counted
+ * towards hashrate only when stale is set, meaning a stale share that met its
+ * diff and was not a duplicate. */
 static void add_submit(stratum_instance_t *client, const double diff, const bool valid,
-		       const bool submit)
+		       const bool stale)
 {
 	sdata_t *ckp_sdata = ckpool.sdata, *sdata = client->sdata;
 	worker_instance_t *worker = client->worker_instance;
@@ -6557,7 +6725,7 @@ static void add_submit(stratum_instance_t *client, const double diff, const bool
 	if (valid) {
 		worker->shares += diff;
 		user->shares += diff;
-	} else if (!submit)
+	} else if (!stale)
 		return;
 
 	tv_time(&now_t);
@@ -6691,42 +6859,26 @@ downstream_block(sdata_t *sdata, yyjson_mut_doc *val, const int cblen,
 }
 
 #ifdef HAVE_CAPNP
-/* Submit a solved IPC-templated block via the mining interface. The coinbase
- * must be witness-serialised (marker+flag + coinbase witness reserved value);
- * the server reconstructs and validates the full block. Returns true if
- * accepted. */
-static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char *coinbase,
-			     const int cblen, const uint32_t ntime32)
+/* Serialise the coinbase the way the block carries it. BIP141 only permits
+ * the coinbase to carry a witness when the block has a witness commitment;
+ * without one the coinbase must be serialised legacy or the block is rejected.
+ * generate_coinbase only emits the commitment when insert_witness is set, so
+ * mirror that here instead of always segwit-serialising. Any block containing
+ * a single segwit transaction forces a commitment, so the legacy form is only
+ * used on a witness-free block, in practice regtest. The coinbase passed in is
+ * already in legacy form (version || vin || vout || locktime). Returns a
+ * ckalloced buffer and stores its length in *len. */
+static uchar *ipc_block_coinbase(const workbase_t *wb, const char *coinbase, const int cblen,
+				 int *len)
 {
-	unsigned char *wcb;
-	uint32_t version, nonce;
-	int wl, accepted = 0;
+	uchar *wcb = ckalloc(cblen + 40);
+	int wl = 0;
 
-	/* A real coinbase is well over 60 bytes; guard the tx version(4) +
-	 * body(cblen-8) + locktime(4) arithmetic below against a degenerate
-	 * length. */
-	if (unlikely(!wb->tmpl || cblen < 12))
-		return false;
-	memcpy(&version, data, 4);
-	memcpy(&nonce, data + 76, 4);
-
-	/* BIP141 only permits the coinbase to carry a witness when the block
-	 * has a witness commitment; without one the coinbase must be serialised
-	 * legacy or the block is rejected. generate_coinbase only emits the
-	 * commitment when insert_witness is set, so mirror that here instead of
-	 * always segwit-serialising. Any block containing a single segwit
-	 * transaction forces a commitment, so this is only reached on a
-	 * witness-free block, in practice regtest. The coinbase is already in
-	 * legacy form (version || vin || vout || locktime) so submit it as is. */
 	if (unlikely(!wb->insert_witness)) {
-		if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce,
-					       (const unsigned char *)coinbase,
-					       (size_t)cblen, &accepted))
-			accepted = 0;
-		return accepted;
+		memcpy(wcb, coinbase, cblen);
+		*len = cblen;
+		return wcb;
 	}
-
-	wcb = ckalloc(cblen + 40);
 	memcpy(wcb, coinbase, 4);			/* tx version */
 	wl = 4;
 	wcb[wl++] = 0x00; wcb[wl++] = 0x01;		/* segwit marker + flag */
@@ -6738,11 +6890,90 @@ static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char
 	wl += 32;
 	memcpy(wcb + wl, coinbase + cblen - 4, 4);	/* lock time */
 	wl += 4;
+	*len = wl;
+	return wcb;
+}
 
-	if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce, wcb, wl, &accepted))
+/* Submit a solved IPC-templated block via the mining interface; the server
+ * reconstructs and validates the full block. Returns true if accepted. Sets
+ * *duplicate when bitcoind already has this exact block, such as from a
+ * replayed share, which must not be retried or reported as a new solve. */
+static bool ipc_submit_block(const workbase_t *wb, const uchar *data, const char *coinbase,
+			     const int cblen, const uint32_t ntime32, bool *duplicate)
+{
+	char reason[128] = {}, debug[256] = {};
+	uint32_t version, nonce;
+	int wl, accepted = 0;
+	uchar *wcb;
+
+	/* A real coinbase is well over 60 bytes; guard the tx version(4) +
+	 * body(cblen-8) + locktime(4) arithmetic against a degenerate length. */
+	if (unlikely(!wb->tmpl || cblen < 12))
+		return false;
+	memcpy(&version, data, 4);
+	memcpy(&nonce, data + 76, 4);
+
+	wcb = ipc_block_coinbase(wb, coinbase, cblen, &wl);
+	if (mining_ipc_submit_solution(wb->tmpl, version, ntime32, nonce, wcb, wl, &accepted,
+				       reason, sizeof(reason), debug, sizeof(debug))) {
+		LOGWARNING("Failed to submit block %d on the mining IPC", wb->height);
 		accepted = 0;
-	free(wcb);
+	} else if (!accepted) {
+		LOGWARNING("Mining IPC rejected block %d: %s %s", wb->height, reason, debug);
+		*duplicate = !strcmp(reason, "duplicate");
+	}
+	dealloc(wcb);
 	return accepted;
+}
+
+/* Fall back to submitting an IPC-templated block over RPC, so a solve never
+ * depends on the mining IPC alone. The template's own block supplies the
+ * transactions; its header and coinbase are replaced by ours. Returns true if
+ * accepted. */
+static bool ipc_rpc_submit_block(const workbase_t *wb, const uchar *data, const char *coinbase,
+				 const int cblen, const uchar *flip32)
+{
+	const uint8_t *p, *end;
+	uchar *tblock = NULL, *wcb;
+	size_t tlen, cbtxlen, rest;
+	char *gbt_block, *hex;
+	uint64_t txns;
+	int wl;
+
+	if (unlikely(!wb->tmpl || cblen < 12))
+		return false;
+	if (mining_ipc_template_block(wb->tmpl, &tblock, &tlen)) {
+		LOGWARNING("Failed to fetch template block %d to submit over RPC", wb->height);
+		return false;
+	}
+	/* Skip the template's header, transaction count and its own coinbase */
+	p = tblock + 80;
+	end = tblock + tlen;
+	if (tlen <= 80 || !sv2_read_compact_size(&p, end, &txns) || !txns ||
+	    !sv2_bitcoin_tx_parse(p, end - p, &cbtxlen, NULL, NULL)) {
+		LOGWARNING("Failed to parse template block %d to submit over RPC", wb->height);
+		mining_ipc_block_free(tblock);
+		return false;
+	}
+	p += cbtxlen;
+	rest = end - p;
+
+	wcb = ipc_block_coinbase(wb, coinbase, cblen, &wl);
+	/* Header and transaction count, our coinbase, then the transactions */
+	gbt_block = ckalloc((80 + 9 + wl + rest) * 2 + 1);
+	hex = gbt_block;
+	__bin2hex(hex, data, 80);
+	hex += 160;
+	__bin2hex(hex, tblock + 80, (p - cbtxlen) - (tblock + 80));
+	hex += strlen(hex);
+	__bin2hex(hex, wcb, wl);
+	hex += wl * 2;
+	__bin2hex(hex, p, rest);
+	dealloc(wcb);
+	mining_ipc_block_free(tblock);
+
+	LOGWARNING("Submitting block %d over RPC", wb->height);
+	return local_block_submit(gbt_block, flip32, wb->height);
 }
 #endif
 
@@ -6763,8 +6994,10 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	ts_t ts_now;
 	bool ret;
 
-	/* Submit anything over 99.9% of the diff in case of rounding errors */
-	network_diff = sdata->current_workbase->network_diff * 0.999;
+	/* Submit anything over 99.9% of the diff in case of rounding errors.
+	 * The share's own workbase sets its target, not the current one, which
+	 * can differ, such as across min difficulty blocks on testnet. */
+	network_diff = wb->network_diff * 0.999;
 	if (likely(diff < network_diff))
 		return;
 
@@ -6838,9 +7071,13 @@ test_blocksolve(const stratum_instance_t *client, const workbase_t *wb, const uc
 	/* Submit block locally after sending it to remote locations avoiding
 	 * the delay of local verification */
 #ifdef HAVE_CAPNP
-	if (wb->ipc)
-		ret = ipc_submit_block(wb, data, coinbase, cblen, ntime32);
-	else
+	if (wb->ipc) {
+		bool duplicate = false;
+
+		ret = ipc_submit_block(wb, data, coinbase, cblen, ntime32, &duplicate);
+		if (!ret && !duplicate)
+			ret = ipc_rpc_submit_block(wb, data, coinbase, cblen, flip32);
+	} else
 #endif
 		ret = local_block_submit(gbt_block, flip32, wb->height);
 	if (ret)
@@ -7088,6 +7325,7 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 				 int server, const uint8_t *enonce1, int enonce1_len,
 				 double diff, int64_t *out_instance_id)
 {
+	const char *user_error = NULL;
 	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	user_instance_t *user;
@@ -7122,9 +7360,9 @@ bool stratifier_sv2_open_session(int64_t connector_id, uint32_t channel_id,
 	snprintf(client->identity, sizeof(client->identity),
 		 "sv2:%"PRId64":%u", connector_id, channel_id);
 
-	user = generate_user(client, user_identity);
+	user = generate_user(client, user_identity, &user_error);
 	if (unlikely(!user)) {
-		LOGNOTICE("SV2 reject user %s with maxusers reached", user_identity);
+		LOGNOTICE("SV2 reject user %s: %s", user_identity, user_error);
 		client->dropped = true;
 		dec_instance_ref(sdata, client);
 		return false;
@@ -7281,7 +7519,6 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 	stratum_instance_t *client;
 	sdata_t *sdata = ckpool.sdata;
 	int cblen, i, en1len;
-	uint32_t *data32, *swap32;
 
 	if (!stratifier_sv2_snapshot_work(&snap, instance_id))
 		return false;
@@ -7309,9 +7546,10 @@ bool stratifier_sv2_merkle_root(int64_t instance_id, uint8_t merkle_root_le[32],
 		gen_hash(merkle_sha, merkle_root, 64);
 		memcpy(merkle_sha, merkle_root, 32);
 	}
-	data32 = (uint32_t *)merkle_sha;
-	swap32 = (uint32_t *)merkle_root_le;
-	flip_32(swap32, data32);
+	/* Raw SHA256d output is already header byte order, which is what SV2
+	 * NewMiningJob.merkle_root expects. Unlike the v1 share path we are not
+	 * inserting into the word-swapped headerbin, so no flip_32. */
+	memcpy(merkle_root_le, merkle_sha, 32);
 
 	if (wb_id_out)
 		*wb_id_out = snap.wb_id;
@@ -7343,7 +7581,7 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 	char nonce2hex[64], noncehex[16];
 	uchar hash[32];
 	double sdiff, diff;
-	bool stale = false, result = false, submit = false;
+	bool stale = false, result = false;
 	int n2len, expect;
 
 	if (errbuf && errbufsz)
@@ -7411,6 +7649,9 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 
 	if (stale) {
 		snprintf(errbuf, errbufsz, "stale-share");
+		/* Stale shares that met the job diff are still work done. */
+		add_submit(client, job_diff, false,
+			   sdiff >= job_diff && new_share(sdata, hash, workbase_id));
 		put_workbase(sdata, wb);
 		dec_instance_ref(sdata, client);
 		return false;
@@ -7440,15 +7681,7 @@ bool stratifier_sv2_submit_share(int64_t instance_id, int64_t workbase_id,
 		result = false;
 	}
 
-	if (sdiff >= wb->diff)
-		submit = true;
-	ck_rlock(&sdata->workbase_lock);
-	if (sdata->current_workbase &&
-	    sdiff >= sdata->current_workbase->network_diff)
-		submit = true;
-	ck_runlock(&sdata->workbase_lock);
-
-	add_submit(client, diff, result, submit);
+	add_submit(client, diff, result, false);
 	put_workbase(sdata, wb);
 	dec_instance_ref(sdata, client);
 	return result;
@@ -7506,7 +7739,7 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 	sdata_t *sdata = ckpool.sdata;
 	stratum_instance_t *client;
 	double diff, network_diff = 0;
-	bool result = false, submit = false;
+	bool result = false;
 	int64_t wb_id = workbase_id;
 
 	if (network_diff_met)
@@ -7514,8 +7747,27 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 	if (errbuf && errbufsz)
 		errbuf[0] = '\0';
 	if (!sv2_custom_job_current(sdata, workbase_id)) {
+		workbase_t *wb;
+		bool stale;
+
 		if (errbuf && errbufsz)
 			snprintf(errbuf, errbufsz, "stale-share");
+		client = ref_instance_by_id(sdata, instance_id);
+		if (!client || !client->authorised) {
+			if (client)
+				dec_instance_ref(sdata, client);
+			return false;
+		}
+		/* Stale shares that met the job diff are still work done, while
+		 * their workbase exists to detect duplicates against. */
+		wb = workbase_id > 0 && workbase_id < sdata->blockchange_id ?
+			get_workbase(sdata, workbase_id) : NULL;
+		stale = wb && sdiff >= job_diff && new_share(sdata, hash, wb_id);
+		if (wb) {
+			put_workbase(sdata, wb);
+			add_submit(client, job_diff, false, stale);
+		}
+		dec_instance_ref(sdata, client);
 		return false;
 	}
 	client = ref_instance_by_id(sdata, instance_id);
@@ -7552,17 +7804,12 @@ bool stratifier_sv2_account_share(int64_t instance_id, int64_t workbase_id,
 		result = false;
 	}
 	ck_rlock(&sdata->workbase_lock);
-	if (sdata->current_workbase) {
+	if (sdata->current_workbase)
 		network_diff = sdata->current_workbase->network_diff;
-		if (sdiff >= sdata->current_workbase->diff)
-			submit = true;
-		if (sdiff >= network_diff)
-			submit = true;
-	}
 	ck_runlock(&sdata->workbase_lock);
 	if (network_diff_met && result && sdiff >= network_diff && network_diff > 0)
 		*network_diff_met = true;
-	add_submit(client, diff, result, submit);
+	add_submit(client, diff, result, false);
 	dec_instance_ref(sdata, client);
 	return result;
 }
@@ -7582,12 +7829,6 @@ bool stratifier_sv2_submit_block_bin(const unsigned char *block, size_t block_le
 
 	if (!block || block_len < 80 || block_len > 4 * 1024 * 1024)
 		return false;
-	hex = ckalloc(block_len * 2 + 1);
-	__bin2hex(hex, block, block_len);
-	/* generator_submitblock expects hex block data via submit path */
-	ret = generator_submitblock(hex);
-	dealloc(hex);
-
 	/* Block hash: dsha256(wire header), display = byte-reversed */
 	{
 		int i;
@@ -7598,6 +7839,18 @@ bool stratifier_sv2_submit_block_bin(const unsigned char *block, size_t block_le
 			swap[i] = hash[31 - i];
 		__bin2hex(blockhash, swap, 32);
 	}
+
+	hex = ckalloc(block_len * 2 + 1);
+	__bin2hex(hex, block, block_len);
+	/* generator_submitblock expects hex block data via submit path */
+	{
+		int submitted = generator_submitblock(hex);
+
+		if (unlikely(submitted < 0))
+			save_unsubmitted_block(hex, blockhash, 0);
+		ret = submitted > 0;
+	}
+	dealloc(hex);
 
 	ck_rlock(&sdata->workbase_lock);
 	if (sdata->current_workbase) {
@@ -7751,6 +8004,7 @@ static bool parse_submit(stratum_instance_t *client, yyjson_mut_val *params_val,
 			 enum share_err *err_code)
 {
 	bool share = false, result = false, invalid = true, submit = false, stale = false;
+	bool stale_credit = false;
 	const char *workername, *job_id, *ntime, *version_mask;
 	double diff = client->diff, wdiff = 0, sdiff = -1;
 	char hexhash[68] = {}, sharehash[32], cdfield[64];
@@ -7961,7 +8215,10 @@ out_nowb:
 		submit_share(client, id, nonce2, ntime, nonce, version_mask32);
 	}
 
-	add_submit(client, diff, result, submit);
+	/* Stale shares that met the share diff are still work done. */
+	if (err == SE_STALE && sdiff >= diff && new_share(sdata, hash, id))
+		stale_credit = true;
+	add_submit(client, diff, result, stale_credit);
 
 	doc = yyjson_mut_pack("{sIsIsssssssssfsfsssbsssissssssssssssssss}",
 		"workinfoid", id,
@@ -7988,10 +8245,9 @@ out_nowb:
 	if (ckpool.logshares) {
 		fp = fopen(fname, "ae");
 		if (likely(fp)) {
-			yyjson_mut_write_file(fname, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL);
-			fclose(fp);
-			if (unlikely(len < 0))
+			if (unlikely(!yyjson_mut_write_fp(fp, doc, YYJSON_WRITE_NEWLINE_AT_END, NULL, NULL)))
 				LOGERR("Failed to fwrite to %s", fname);
+			fclose(fp);
 		} else
 			LOGERR("Failed to fopen %s", fname);
 	}
@@ -8090,7 +8346,7 @@ static void stratum_send_update(sdata_t *sdata, const int64_t client_id, const b
 	stratum_add_yysend(sdata, doc, client_id, SM_UPDATE);
 }
 
-/* Hold instance and workbase lock */
+/* Hold instance_lock, and either the workbase lock or a readcount on wb */
 static yyjson_mut_doc *__user_notify(const workbase_t *wb, const user_instance_t *user, const bool clean)
 {
 	int64_t id = wb->id;
@@ -8128,6 +8384,19 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 {
 	stratum_instance_t *client, *tmp;
 	yyjson_mut_doc *doc;
+	workbase_t *wb;
+
+	/* Hold a readcount on the workbase rather than its lock, so each
+	 * user's userwbs can be read under the instance_lock they are added
+	 * and deleted under without nesting the two locks. */
+	ck_wlock(&sdata->workbase_lock);
+	wb = sdata->current_workbase;
+	if (likely(wb))
+		wb->readcount++;
+	ck_wunlock(&sdata->workbase_lock);
+	/* No work to broadcast before the first template */
+	if (unlikely(!wb))
+		return;
 
 	ck_wlock(&sdata->instance_lock);
 	HASH_ITER(hh, sdata->stratum_instances, client, tmp) {
@@ -8138,20 +8407,22 @@ static void stratum_broadcast_updates(sdata_t *sdata, bool clean)
 		 * sv2_strat_on_work_update after this loop. */
 		if (client->sv2)
 			continue;
+		doc = __user_notify(wb, client->user_instance, clean);
+		if (unlikely(!doc))
+			continue;
 		__inc_instance_ref(client);
 		ck_wunlock(&sdata->instance_lock);
 
-		ck_rlock(&sdata->workbase_lock);
-		doc = __user_notify(sdata->current_workbase, client->user_instance, clean);
-		ck_runlock(&sdata->workbase_lock);
-
-		if (likely(doc))
-			stratum_add_yysend(sdata, doc, client->id, SM_UPDATE);
+		stratum_add_yysend(sdata, doc, client->id, SM_UPDATE);
 
 		ck_wlock(&sdata->instance_lock);
 		__dec_instance_ref(client);
 	}
 	ck_wunlock(&sdata->instance_lock);
+
+	ck_wlock(&sdata->workbase_lock);
+	wb->readcount--;
+	ck_wunlock(&sdata->workbase_lock);
 #ifdef HAVE_SV2
 	/* Solo path never went through stratum_broadcast_update before */
 	sv2_strat_on_work_update(clean);
@@ -8648,6 +8919,7 @@ static user_instance_t *generate_remote_user(const char *workername)
 
 	user = get_create_user(sdata, username, &new_user);
 
+<<<<<<< HEAD
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
 		/* Is this a btc address based username? */
 		if (generator_checkaddr(username, &user->script, &user->segwit)) {
@@ -8655,6 +8927,10 @@ static user_instance_t *generate_remote_user(const char *workername)
 			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckpool.ecash);
 		}
 	}
+=======
+	if (!ckpool.proxy && (new_user || !user->btcaddress))
+		user_check_address(sdata, user, username);
+>>>>>>> upstream/master
 	if (new_user) {
 		LOGNOTICE("Added new remote user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
@@ -10015,13 +10291,15 @@ static void *statsupdate(void __maybe_unused *arg)
 			worker_instance_t *worker;
 			yyjson_mut_val *root;
 
-			if (!user->authorised)
-				continue;
-
 			tv_time(&now);
 
 			/* Decay times per user */
 			per_tdiff = tvdiff(&now, &user->last_share);
+			/* Users restored at startup are unauthorised until they
+			 * reconnect, but their stored stats must keep decaying
+			 * until their workers would no longer be stored. */
+			if (!user->authorised && (!user->auth_time || per_tdiff > 600000))
+				continue;
 			/* Drop storage of users with no shares */
 			if (!user->last_share.tv_sec) {
 				LOGDEBUG("Skipping inactive user %s", user->username);
@@ -10129,7 +10407,7 @@ static void *statsupdate(void __maybe_unused *arg)
 			s = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY | YYJSON_WRITE_NEWLINE_AT_END, NULL);
 			add_log_entry(&log_entries, &fname, &s);
 			yyjson_mut_doc_free(doc);
-			if (ckpool.remote)
+			if (ckpool.remote && user->authorised)
 				upstream_workers(user);
 		}
 
@@ -10599,12 +10877,11 @@ static void *ipcnotify(void __maybe_unused *arg)
 	while (!ckpool.shutdown) {
 		mining_tip new_tip = {};
 		/* Wait for a tip change. A new block returns immediately; the
-		 * timeout (in seconds) only bounds how often we wake to notice a
-		 * dropped connection or a shutdown request. A short window also
-		 * means we are rarely blocked mid-request, since closing the
-		 * socket while a long waitTipChanged executes wedges bitcoind's
-		 * IPC server. */
-		int rc = mining_ipc_wait_tip_changed(ctx, tip.hash, 5.0, &new_tip);
+		 * 1 second timeout only bounds how often we wake to notice a
+		 * dropped connection or a shutdown request, so a shutdown waits
+		 * at most that long for this thread to disconnect cleanly rather
+		 * than closing the socket under an in-flight waitTipChanged. */
+		int rc = mining_ipc_wait_tip_changed(ctx, tip.hash, 1.0, &new_tip);
 
 		if (!rc) {
 			if (memcmp(new_tip.hash, tip.hash, 64)) {
@@ -10613,6 +10890,13 @@ static void *ipcnotify(void __maybe_unused *arg)
 					  new_tip.height);
 				tip = new_tip;
 			}
+			continue;
+		}
+		/* bitcoind is shutting down and returns at once on every call
+		 * until it drops the connection, so pace the retries instead of
+		 * spinning on it. */
+		if (rc == MINING_IPC_NO_TIP) {
+			cksleep_ms(1000);
 			continue;
 		}
 
@@ -10660,9 +10944,9 @@ void stratifier_shutdown_ipc(void)
 {
 	int waited = 0;
 
-	/* Bound the wait comfortably above the ipcnotify wait window (5s) so it
+	/* Bound the wait comfortably above the ipcnotify wait window (1s) so it
 	 * has time to notice the shutdown, break out and disconnect. */
-	while (ckpool.btc_mining_ctx && waited++ < 200)
+	while (ckpool.btc_mining_ctx && waited++ < 60)
 		cksleep_ms(50);
 }
 

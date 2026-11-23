@@ -1638,6 +1638,7 @@ void sv2_jdc_solved(const struct sv2_jdc_solution *sol)
 {
 	struct sv2_push_solution ps;
 	uint8_t buf[SV2_PUSH_SOLUTION_MAX_BYTES];
+	char reason[128] = {}, debug[256] = {};
 	size_t plen = 0;
 	int accepted = 0;
 	uint64_t generation;
@@ -1688,14 +1689,14 @@ void sv2_jdc_solved(const struct sv2_jdc_solution *sol)
 	 */
 	if (mining_ipc_submit_solution(sol->t->tmpl, sol->version, sol->ntime,
 				       sol->nonce, sol->coinbase, sol->coinbase_len,
-				       &accepted)) {
+				       &accepted, reason, sizeof(reason), debug, sizeof(debug))) {
 		LOGWARNING("JDC local block submit height %d template %"PRIu64" failed on "
 			   "the mining IPC", sol->t->height, sol->t->id);
 		return;
 	}
 	LOGWARNING("JDC local block submit height %d template %"PRIu64" coinbase %zu "
-		   "bytes: %s by our node", sol->t->height, sol->t->id,
-		   sol->coinbase_len, accepted ? "ACCEPTED" : "rejected");
+		   "bytes: %s by our node %s %s", sol->t->height, sol->t->id,
+		   sol->coinbase_len, accepted ? "ACCEPTED" : "rejected", reason, debug);
 }
 
 /*
@@ -2201,7 +2202,15 @@ static void *jdc_tipwaiter(void __maybe_unused *arg)
 
 	while (!ckpool.shutdown) {
 		mining_tip new_tip = {};
-		int rc = mining_ipc_wait_tip_changed(ctx, tip.hash, 5.0, &new_tip);
+		tv_t wait_start, wait_end;
+		int rc;
+
+		/* A new tip returns immediately; the 1 second timeout only
+		 * bounds how often we wake to refresh, notice a dropped
+		 * connection, or see a shutdown request. */
+		tv_time(&wait_start);
+		rc = mining_ipc_wait_tip_changed(ctx, tip.hash, 1.0, &new_tip);
+		tv_time(&wait_end);
 
 		if (!rc) {
 			if (memcmp(new_tip.hash, tip.hash, 64)) {
@@ -2244,14 +2253,22 @@ static void *jdc_tipwaiter(void __maybe_unused *arg)
 			/*
 			 * Same tip: due a fee-bump refresh if the interval has
 			 * elapsed (queue_build decides). Normally this is the wait
-			 * timing out, but it also returns immediately while
-			 * bitcoind has not connected a block since it started (its
-			 * notification tip is unset and so never compares equal to
-			 * ours), so it cannot be relied on for pacing — sleep
-			 * before asking again or we spin at IPC speed.
+			 * timing out, which paces the loop by itself. Should it
+			 * ever return early with the same tip, sleep before asking
+			 * again rather than spin at IPC speed, but never after a
+			 * full wait, where sleeping would only delay noticing a
+			 * new block.
 			 */
 			queue_build(false);
-			cksleep_ms(SV2_JDC_TIP_POLL_MS);
+			if (ms_tvdiff(&wait_end, &wait_start) < SV2_JDC_TIP_POLL_MS)
+				cksleep_ms(SV2_JDC_TIP_POLL_MS);
+			continue;
+		}
+		/* bitcoind is shutting down and returns at once on every call
+		 * until it drops the connection, so pace the retries instead of
+		 * spinning on it. */
+		if (rc == MINING_IPC_NO_TIP) {
+			cksleep_ms(1000);
 			continue;
 		}
 
@@ -2345,7 +2362,7 @@ void sv2_jdc_start(void)
 /*
  * Called from the main thread once ckpool.shutdown is set, before the process
  * exits. Drops the template service, then waits — bounded well above the tip
- * thread's own 5s wait window — for that thread to disconnect on its own
+ * thread's own 1s wait window — for that thread to disconnect on its own
  * capnp-affine thread. Safe to call unconditionally.
  */
 void sv2_jdc_stop(void)
@@ -2357,7 +2374,7 @@ void sv2_jdc_stop(void)
 		jdc_svc = NULL;
 		mining_ipc_service_disconnect(svc);
 	}
-	while (jdc_tip_ctx && waited++ < 200)
+	while (jdc_tip_ctx && waited++ < 60)
 		cksleep_ms(50);
 }
 

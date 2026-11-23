@@ -222,8 +222,8 @@ down.
 name, killing it if need be. Otherwise ckpool will refuse to start if an
 instance of the same name is already running.
 
-`-L` will log per share information in the logs directory divided by block
-height and then workbase.
+`-L` will log per share information and workbase information in the logs
+directory divided by block height and then workbase.
 
 `-l <LOGLEVEL>` will change the log level to that specified. Default is 5 and
 maximum debug is level 7.
@@ -333,7 +333,9 @@ the health of the bitcoin network.
 
 `"version_mask"` : This is a mask of which bits in the version number it is
 valid for a client to alter and is expressed as an hex string. Eg `"00fff000"`
-Default is `"1fffe000"`.
+Default is `"1fffe000"`. Stratum V2 cannot advertise a mask, so SV2 clients may
+alter any BIP323 bit (`"1fffffe0"`) unless this is set to `"0"`, which disables
+SV2 version rolling entirely.
 
 `"dropidle"` : Drop clients which have been idle for this duration in seconds,
 use 0 to disable. Default 0.
@@ -379,6 +381,9 @@ and getblocktemplate when active (falling back to RPC if the interface is
 unavailable). In proxy mode it is required when any proxy entry has a `"jds"`
 Job Declaration client. Example: `"/tmp/btc-mining.sock"`
 Requires bitcoind `-ipcbind`, e.g.:
+
+NOTE: The IPC version is tied to the bitcoin core version and the current code
+is designed for use with Bitcoin Core version 32.x.
 
 ```bash
 bitcoind -m node -ipcbind=unix:/tmp/btc-mining.sock

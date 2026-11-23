@@ -344,15 +344,16 @@ static bool channel_lookup_job_locked(struct sv2_channel *ch, uint32_t job_id,
 /*
  * Spec §5.3.16 / §5.3.15 / §5.3.18: SubmitShares carries full nVersion.
  * When version_rolling is false the client MUST use the job version as-is.
- * When true, only bits in ckpool.version_mask (BIP320 / pool policy) may
- * differ from the job version — same rule as SV1 invalid-version-mask.
+ * When true, any BIP323 general purpose bit may differ from the job version.
+ * SV2 cannot advertise a narrower mask the way SV1 mining.configure does, so
+ * ckpool.version_mask only decides whether rolling is allowed at all.
  */
 static bool sv2_submit_version_ok(uint32_t submitted, uint32_t job_version,
 				  bool version_rolling)
 {
 	if (!version_rolling)
 		return submitted == job_version;
-	return ((submitted ^ job_version) & ~ckpool.version_mask) == 0;
+	return ((submitted ^ job_version) & ~SV2_BIP323_VERSION_MASK) == 0;
 }
 
 /* Drop all custom jobs (tip change). Pool-template slots stay. */
@@ -1016,6 +1017,11 @@ static uint8_t *handle_setup(struct sv2_client *c, const uint8_t *payload,
 	c->flags = sc.flags;
 	memset(&ok, 0, sizeof(ok));
 	ok.used_version = 2;
+	/* §5.3.1: NewMiningJob always permits rolling the BIP323 bits unless
+	 * we say otherwise here. REQUIRES_VERSION_ROLLING clients were refused
+	 * above when there is no mask, so this never contradicts their flags. */
+	if (!ckpool.version_mask)
+		ok.flags |= SV2_FLAG_REQUIRES_FIXED_VERSION;
 	if (!sv2_encode_setup_connection_success(pbuf, sizeof(pbuf), &plen, &ok))
 		return NULL;
 	LOGNOTICE("SV2 SetupConnection ok client %"PRId64" vendor=%s%s",
@@ -2079,6 +2085,46 @@ void sv2_strat_clear_instance(int64_t instance_id)
 	mutex_unlock(&sv2_lock);
 }
 
+/*
+ * CloseChannel for one channel, or for every member when channel_id names one
+ * of our groups (spec 5.3.9). Same two-phase free as sv2_strat_drop_client.
+ */
+static void close_channels(int64_t client_id, uint32_t channel_id)
+{
+	bool group = channel_id == SV2_STANDARD_GROUP_ID ||
+		     channel_id == SV2_EXTENDED_GROUP_ID;
+	struct sv2_channel *ch, *tmp, *dead, **to_free = NULL;
+	int nfree = 0, niids = 0, i;
+	int64_t *iids = NULL;
+
+	ensure_lock();
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id != client_id)
+			continue;
+		if (group ? ch->standard != (channel_id == SV2_STANDARD_GROUP_ID) :
+		    ch->channel_id != channel_id)
+			continue;
+		if (ch->instance_id) {
+			iids = ckrealloc(iids, (niids + 1) * sizeof(*iids));
+			iids[niids++] = ch->instance_id;
+		}
+		HASH_DEL(sv2_channels, ch);
+		dead = channel_unref_locked(ch);
+		if (dead) {
+			to_free = ckrealloc(to_free, (nfree + 1) * sizeof(*to_free));
+			to_free[nfree++] = dead;
+		}
+	}
+	mutex_unlock(&sv2_lock);
+	for (i = 0; i < nfree; i++)
+		channel_finish_free(to_free[i]);
+	dealloc(to_free);
+	for (i = 0; i < niids; i++)
+		stratifier_sv2_close_session(iids[i]);
+	dealloc(iids);
+}
+
 uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 				size_t framelen, size_t *replylen)
 {
@@ -2248,28 +2294,9 @@ uint8_t *sv2_strat_handle_frame(int64_t client_id, const uint8_t *frame,
 	}
 	case SV2_MSG_CLOSE_CHANNEL: {
 		struct sv2_close_channel cl;
-		struct sv2_channel *ch;
-		struct sv2_chan_key key;
-		int64_t iid = 0;
 
-		if (sv2_decode_close_channel(payload, plen, &cl)) {
-			struct sv2_channel *dead = NULL;
-
-			chan_key_init(&key, client_id, cl.channel_id);
-			ensure_lock();
-			mutex_lock(&sv2_lock);
-			HASH_FIND(hh, sv2_channels, &key, sizeof(key), ch);
-			if (ch) {
-				iid = ch->instance_id;
-				HASH_DEL(sv2_channels, ch);
-				dead = channel_unref_locked(ch);
-			}
-			mutex_unlock(&sv2_lock);
-			if (dead)
-				channel_finish_free(dead);
-			if (iid)
-				stratifier_sv2_close_session(iid);
-		}
+		if (sv2_decode_close_channel(payload, plen, &cl))
+			close_channels(client_id, cl.channel_id);
 		ret = NULL;
 		break;
 	}

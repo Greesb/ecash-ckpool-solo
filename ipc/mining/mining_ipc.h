@@ -53,9 +53,14 @@ int mining_ipc_try_obtain_mining(mining_ipc_ctx *ctx);
 int mining_ipc_get_tip(mining_ipc_ctx *ctx, mining_tip *out_tip);
 
 /* Block until the chain tip differs from current_tip_hex (64 hex chars) or
- * timeout_seconds elapses. Returns 0 and fills out_new_tip when a new tip
- * arrives; non-zero on timeout or failure. A timeout is a normal, non-fatal
- * result; a disconnection flags the context for reconnection. */
+ * timeout_seconds elapses, returning as soon as a new tip is connected
+ * regardless of the timeout. A timeout_seconds <= 0 waits indefinitely.
+ * Returns 0 and fills out_new_tip with the new tip, or with the unchanged tip
+ * on timeout; MINING_IPC_NO_TIP without waiting once bitcoind is shutting
+ * down, with the connection left up; other non-zero values on failure,
+ * including a disconnection, which flags the context for reconnection. */
+#define MINING_IPC_NO_TIP	1
+
 int mining_ipc_wait_tip_changed(mining_ipc_ctx *ctx,
 				const char *current_tip_hex,
 				double timeout_seconds,
@@ -157,11 +162,14 @@ void mining_ipc_block_free(unsigned char *block);
 
 /* Submit a mined solution for a template. coinbase is the full assembled
  * coinbase transaction bytes. Returns 0 and sets *accepted on a completed
- * call; non-zero on RPC failure. */
+ * call; non-zero on RPC failure. On rejection, reason/debug are filled when
+ * non-NULL buffers are provided (NUL-terminated, truncated to size-1). */
 int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			       uint32_t timestamp, uint32_t nonce,
 			       const unsigned char *coinbase, size_t coinbase_len,
-			       int *accepted);
+			       int *accepted,
+			       char *reason, size_t reason_sz,
+			       char *debug, size_t debug_sz);
 
 /* Release a template handle. Safe with NULL. */
 void mining_block_template_destroy(mining_block_template *t);

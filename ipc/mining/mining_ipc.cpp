@@ -45,6 +45,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <stdexcept>
@@ -221,9 +222,15 @@ public:
 			auto req = mining_.waitTipChangedRequest();
 			fill_context(req.initContext());
 			req.setCurrentTip(kj::arrayPtr(reinterpret_cast<const capnp::byte *>(tip), 32));
-			req.setTimeout(timeout_seconds > 0 ? timeout_seconds : 1e9);
+			/* bitcoind takes the timeout in milliseconds, and waits
+			 * indefinitely for a new tip without one. */
+			if (timeout_seconds > 0)
+				req.setTimeout(timeout_seconds * 1000);
 
 			auto resp = req.send().wait(ws);
+			/* bitcoind returns no tip only once it is shutting down. */
+			if (!resp.hasResult())
+				return MINING_IPC_NO_TIP;
 			return fill_tip(resp.getResult(), out);
 		} catch (const kj::Exception &e) {
 			/* bitcoind signals a genuine timeout by returning the current
@@ -344,27 +351,50 @@ public:
 
 	~MiningService()
 	{
+		/* Only reached once shutdown() has joined the thread, see
+		 * mining_ipc_service_disconnect(). Detach rather than let a
+		 * joinable std::thread terminate the process. */
+		if (!shutdown(0))
+			thread_.detach();
+	}
+
+	/* Stop the service thread, waiting up to wait_ms for it to exit. Returns
+	 * true once it has exited and been joined, after which the object may
+	 * be freed; until then the thread is still using it. */
+	bool shutdown(int wait_ms)
+	{
 		/* The capnp capability members reference the event loop owned by the
 		 * service thread and must be destroyed there, not on the caller's
 		 * thread. Reset them on the service thread; the member destructors
 		 * that then run on this thread are no-ops on null capabilities. Only
 		 * attempt this while connected: if the service thread is looping in
 		 * reconnect (not in the event loop) executeSync would block until it
-		 * returned, potentially forever if bitcoind is down. */
+		 * returned, potentially forever if bitcoind is down. Once the thread
+		 * has exited its event loop, and so the executor, is gone. */
 		/* Before reset_caps(), so the keepalive loop this is about to
 		 * unpark sees the stop and returns rather than reconnecting into a
 		 * service that is being destroyed. */
 		stop_.store(true);
-		if (executor_ && connected_.load()) {
+		if (executor_ && connected_.load() && !exited_.load()) {
 			try {
 				executor_->executeSync([this]() { reset_caps(); });
 			} catch (...) {
 			}
 		}
-		/* The service thread runs a kj loop for the process lifetime; detach
-		 * rather than join to avoid blocking on the cross-thread wakeup. */
-		if (thread_.joinable())
-			thread_.detach();
+		if (!thread_.joinable())
+			return true;
+		/* The thread only notices the stop between keepalive probes, and a
+		 * probe to a hung bitcoind may never return, so wait for it only
+		 * briefly. */
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			cv_.wait_for(lock, std::chrono::milliseconds(wait_ms),
+				     [this] { return exited_.load(); });
+		}
+		if (!exited_.load())
+			return false;
+		thread_.join();
+		return true;
 	}
 
 	/* Start the background thread and block until its first connect attempt
@@ -372,7 +402,16 @@ public:
 	 * whether mining is yet available). */
 	bool start()
 	{
-		thread_ = std::thread([this] { thread_main(); });
+		thread_ = std::thread([this] {
+			thread_main();
+			/* After thread_main()'s locals, including its event
+			 * loop, are gone. */
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				exited_.store(true);
+			}
+			cv_.notify_all();
+		});
 		std::unique_lock<std::mutex> lock(mutex_);
 		cv_.wait(lock, [this] { return started_; });
 		return true;
@@ -385,6 +424,12 @@ public:
 	template <typename Func>
 	auto run(Func &&func) -> decltype(std::declval<kj::Executor>().executeSync(std::declval<Func>()))
 	{
+		/* While disconnected the service thread sits in its reconnect
+		 * wait outside the event loop, so executeSync would block the
+		 * caller, such as a share thread submitting a block, until
+		 * bitcoind comes back. Fail now so it can fall back instead. */
+		if (!connected_.load())
+			throw std::runtime_error("mining IPC not connected");
 		return executor_->executeSync(kj::fwd<Func>(func));
 	}
 
@@ -595,6 +640,7 @@ private:
 	std::atomic<bool> stop_{false};
 	std::atomic<bool> connected_{false};
 	std::atomic<bool> have_mining_{false};
+	std::atomic<bool> exited_{false};	/* service thread has finished */
 
 	bool started_ = false;
 	std::mutex mutex_;
@@ -705,7 +751,14 @@ mining_ipc_service *mining_ipc_service_connect(const char *socket_path)
 
 void mining_ipc_service_disconnect(mining_ipc_service *svc)
 {
-	delete reinterpret_cast<MiningService *>(svc);
+	auto *service = reinterpret_cast<MiningService *>(svc);
+
+	/* The service thread uses the object until it exits, which it only
+	 * notices between keepalive probes. Rather than free it from under a
+	 * thread that has not exited yet, leave it allocated: this is only
+	 * called as the process shuts down. */
+	if (service && service->shutdown(200))
+		delete service;
 }
 
 int mining_ipc_service_ready(mining_ipc_service *svc)
@@ -872,15 +925,34 @@ void mining_ipc_block_free(unsigned char *block)
 	free(block);
 }
 
+/* Copy a reason/debug string into a caller buffer, NUL-terminated and
+ * truncated to fit. Safe with a NULL or zero-sized buffer. */
+static void copy_text(char *buf, size_t sz, const std::string &text)
+{
+	if (!buf || !sz)
+		return;
+	std::snprintf(buf, sz, "%s", text.c_str());
+	buf[sz - 1] = '\0';
+}
+
 int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			       uint32_t timestamp, uint32_t nonce,
-			       const unsigned char *coinbase, size_t coinbase_len, int *accepted)
+			       const unsigned char *coinbase, size_t coinbase_len,
+			       int *accepted,
+			       char *reason, size_t reason_sz,
+			       char *debug, size_t debug_sz)
 {
 	if (!t || !coinbase || !accepted)
 		return -1;
 	auto *h = reinterpret_cast<BlockTemplateHolder *>(t);
 	try {
-		bool ok = h->svc->run([=]() -> kj::Promise<bool> {
+		struct SubmitResult {
+			bool ok;
+			std::string reason;
+			std::string debug;
+		};
+
+		SubmitResult r = h->svc->run([=]() -> kj::Promise<SubmitResult> {
 			auto req = h->client.submitSolutionRequest();
 			h->svc->fill_context(req.initContext());
 			req.setVersion(version);
@@ -888,11 +960,20 @@ int mining_ipc_submit_solution(mining_block_template *t, uint32_t version,
 			req.setNonce(nonce);
 			req.setCoinbase(kj::arrayPtr(reinterpret_cast<const capnp::byte *>(coinbase),
 						     coinbase_len));
-			return req.send().then([](auto resp) -> bool {
-				return resp.getResult();
+			return req.send().then([](auto resp) -> SubmitResult {
+				SubmitResult out;
+				auto reason_t = resp.getReason();
+				auto debug_t = resp.getDebug();
+
+				out.ok = resp.getResult();
+				out.reason = std::string(reason_t.cStr(), reason_t.size());
+				out.debug = std::string(debug_t.cStr(), debug_t.size());
+				return out;
 			});
 		});
-		*accepted = ok ? 1 : 0;
+		*accepted = r.ok ? 1 : 0;
+		copy_text(reason, reason_sz, r.reason);
+		copy_text(debug, debug_sz, r.debug);
 		return 0;
 	} catch (...) {
 		return -1;
@@ -970,22 +1051,8 @@ int mining_ipc_check_block(mining_ipc_service *svc,
 		});
 
 		*valid = r.ok ? 1 : 0;
-		if (reason && reason_sz) {
-			if (r.reason.empty())
-				reason[0] = '\0';
-			else {
-				std::snprintf(reason, reason_sz, "%s", r.reason.c_str());
-				reason[reason_sz - 1] = '\0';
-			}
-		}
-		if (debug && debug_sz) {
-			if (r.debug.empty())
-				debug[0] = '\0';
-			else {
-				std::snprintf(debug, debug_sz, "%s", r.debug.c_str());
-				debug[debug_sz - 1] = '\0';
-			}
-		}
+		copy_text(reason, reason_sz, r.reason);
+		copy_text(debug, debug_sz, r.debug);
 		return 0;
 	} catch (...) {
 		return -1;

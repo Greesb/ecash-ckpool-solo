@@ -575,6 +575,90 @@ static void check_batch_timer(void)
 	sv2_strat_drop_all();
 }
 
+/* Spec 5.1: BIP323 bits 5-28 roll freely, nothing else may change. */
+static void check_version_rolling(void)
+{
+	const uint32_t base = 0x20000000;
+
+	require(sv2_submit_version_ok(base | 0x1fffffe0, base, true), "all BIP323 bits roll");
+	require(sv2_submit_version_ok(base | 0x00001fe0, base, true), "bits 5-12 roll");
+	require(!sv2_submit_version_ok(base | 0x00000010, base, true), "bit 4 is fixed");
+	require(!sv2_submit_version_ok(base ^ 0x20000000, base, true), "bit 29 is fixed");
+	require(!sv2_submit_version_ok(base | 0x00002000, base, false), "no rolling is exact");
+	require(sv2_submit_version_ok(base, base, false), "unrolled version accepted");
+}
+
+static unsigned int count_channels(int64_t client_id, bool standard)
+{
+	struct sv2_channel *ch, *tmp;
+	unsigned int n = 0;
+
+	mutex_lock(&sv2_lock);
+	HASH_ITER(hh, sv2_channels, ch, tmp) {
+		if (ch->client_id == client_id && ch->standard == standard)
+			n++;
+	}
+	mutex_unlock(&sv2_lock);
+	return n;
+}
+
+static void send_close(uint32_t channel_id)
+{
+	uint8_t payload[64], *p = payload;
+
+	sv2_write_u32(&p, channel_id);
+	sv2_write_str0_255(&p, "test");
+	send_request(SV2_MSG_CLOSE_CHANNEL, payload, p - payload, false);
+}
+
+/* Spec 5.3.9: closing a group channel closes every channel in the group. */
+static void check_close_group(void)
+{
+	ckpool.nonce1length = 4;
+	ckpool.nonce2length = 8;
+	check_connection(1, false);
+	require(count_channels(1, true) == 4 && count_channels(1, false) == 4 &&
+		sessions == 8, "four channels of each kind open");
+	send_close(SV2_FIRST_CHANNEL_ID);
+	require(count_channels(1, true) + count_channels(1, false) == 7 && sessions == 7,
+		"single channel close");
+	send_close(SV2_STANDARD_GROUP_ID);
+	require(!count_channels(1, true) && count_channels(1, false) >= 3,
+		"standard group closed, extended untouched");
+	send_close(SV2_EXTENDED_GROUP_ID);
+	require(!count_channels(1, false) && !sessions, "extended group closed");
+	sv2_strat_drop_all();
+}
+
+/* Spec 5.3.1: a pool with no version mask must say so, as standard jobs
+ * otherwise always permit rolling. */
+static void check_fixed_version(void)
+{
+	const uint32_t masks[] = {0, 0x1fffe000};
+	struct sv2_setup_connection_success ok;
+	struct sv2_setup_connection sc = {0};
+	uint32_t saved = ckpool.version_mask;
+	uint8_t payload[512], *reply;
+	size_t len, rlen;
+	unsigned int i;
+
+	sc.min_version = sc.max_version = 2;
+	require(sv2_encode_setup_connection(payload, sizeof(payload), &len, &sc), "encode setup");
+	for (i = 0; i < sizeof(masks) / sizeof(masks[0]); i++) {
+		struct sv2_client c = {0};
+
+		ckpool.version_mask = masks[i];
+		reply = handle_setup(&c, payload, len, &rlen);
+		require(reply && c.setup_ok && reply[2] == SV2_MSG_SETUP_CONNECTION_SUCCESS &&
+			sv2_decode_setup_connection_success(reply + 6, rlen - 6, &ok),
+			"setup accepted");
+		require(!!(ok.flags & SV2_FLAG_REQUIRES_FIXED_VERSION) == !masks[i],
+			"fixed version advertised only without a mask");
+		free(reply);
+	}
+	ckpool.version_mask = saved;
+}
+
 int main(void)
 {
 	const int lengths[][2] = {{4, 8}, {2, 2}, {8, 8}, {8, 2}};
@@ -597,6 +681,9 @@ int main(void)
 	check_protocol_validation();
 	check_batch_timer();
 	check_worker_identities();
+	check_version_rolling();
+	check_fixed_version();
+	check_close_group();
 	puts("sv2_groups: all OK");
 	return 0;
 }
