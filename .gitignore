@@ -2,6 +2,7 @@
 *.bin
 *.la
 *.lo
+*.a
 
 autom4te.cache
 .deps

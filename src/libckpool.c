@@ -1778,48 +1778,6 @@ static inline int8_t bech32(int input) {
 	return (input & 0x80) ? -1 : charset_rev[input];
 }
 
-/* It's assumed that there is no chance of sending invalid chars to these
- * functions as they should have been checked beforehand. */
-/* Decode the data part of a bech32 address into data, which must be at least
- * data_size bytes. Returns false without writing anything if the input cannot
- * be a valid bech32 string. Callers currently only reach this after bitcoind
- * has validated the address, but this must not depend on that: without the
- * length and separator checks a long input containing no '1' yields a negative
- * hrp_len and writes far past the end of the caller's buffer. */
-static bool bech32_decode(uint8_t *data, const int data_size, int *data_len,
-			  const char *input)
-{
-	int input_len = strlen(input), hrp_len, dlen, i;
-	const char *sep;
-
-	*data_len = 0;
-	/* BIP173 caps the whole string at 90 characters. */
-	if (unlikely(input_len < 8 || input_len > 90))
-		return false;
-	/* The separator is the last '1' in the string, and there must be one
-	 * with a human readable part before it and a checksum after it. */
-	sep = strrchr(input, '1');
-	if (unlikely(!sep))
-		return false;
-	hrp_len = sep - input;
-	dlen = input_len - (hrp_len + 1);
-	/* The data part carries a 6 character checksum we do not return. */
-	if (unlikely(hrp_len < 1 || dlen < 6))
-		return false;
-	dlen -= 6;
-	if (unlikely(dlen > data_size))
-		return false;
-	for (i = 0; i < dlen; i++) {
-		int v = bech32(input[i]);
-
-		if (unlikely(v < 0))
-			return false;
-		data[i] = v;
-	}
-	*data_len = dlen;
-	return true;
-}
-
 static void convert_bits(char *out, int *outlen, const uint8_t *in,
 			 int inlen)
 {
@@ -2102,61 +2060,10 @@ static int cashaddr_to_txn(char *p2h, const char *addr, const bool script) {
 	return cashaddr_to_pubkeytxn(p2h, hash);
 }
 
-static int address_to_pubkeytxn(char *pkh, const char *addr)
-{
-	char b58bin[25] = {};
-
-	b58tobin(b58bin, addr);
-	pkh[0] = 0x76;
-	pkh[1] = 0xa9;
-	pkh[2] = 0x14;
-	memcpy(&pkh[3], &b58bin[1], 20);
-	pkh[23] = 0x88;
-	pkh[24] = 0xac;
-	return 25;
-}
-
-static int address_to_scripttxn(char *psh, const char *addr)
-{
-	char b58bin[25] = {};
-
-	b58tobin(b58bin, addr);
-	psh[0] = 0xa9;
-	psh[1] = 0x14;
-	memcpy(&psh[2], &b58bin[1], 20);
-	psh[22] = 0x87;
-	return 23;
-}
-
-static int segaddress_to_txn(char *p2h, const char *addr)
-{
-	int data_len, witdata_len = 0;
-	char *witdata = &p2h[2];
-	uint8_t data[84];
-
-	if (unlikely(!bech32_decode(data, sizeof(data), &data_len, addr) || data_len < 1)) {
-		LOGWARNING("Failed to decode bech32 address %s in segaddress_to_txn", addr);
-		return 0;
-	}
-	p2h[0] = data[0];
-	/* Witness version is > 0 */
-	if (p2h[0])
-		p2h[0] += 0x50;
-	convert_bits(witdata, &witdata_len, data + 1, data_len - 1);
-	p2h[1] = witdata_len;
-	return witdata_len + 2;
-}
-
 /* Convert an address to a transaction and return the length of the transaction */
-int address_to_txn(char *p2h, const char *addr, const bool script, const bool segwit, const bool cashaddr)
+int address_to_txn(char *p2h, const char *addr, const bool script)
 {
-	if (cashaddr)
-		return cashaddr_to_txn(p2h, addr, script);
-	if (segwit)
-		return segaddress_to_txn(p2h, addr);
-	if (script)
-		return address_to_scripttxn(p2h, addr);
-	return address_to_pubkeytxn(p2h, addr);
+	return cashaddr_to_txn(p2h, addr, script);
 }
 
 static const char b58_charset[] =

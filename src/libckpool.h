@@ -636,7 +636,7 @@ void b58tobin(char *b58bin, const char *b58);
 int safecmp(const char *a, const char *b);
 bool cmdmatch(const char *buf, const char *cmd);
 
-int address_to_txn(char *p2h, const char *addr, const bool script, const bool segwit, const bool cashaddr);
+int address_to_txn(char *p2h, const char *addr, const bool script);
 bool txn_to_address(char *addr, const size_t alen, const uchar *script, const int slen,
 		    const char *ref);
 int coinbase_payout_script(uchar *script, int *slen, int64_t *value, const uchar *cb1,

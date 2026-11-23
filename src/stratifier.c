@@ -6335,7 +6335,7 @@ static bool user_publish_address(sdata_t *sdata, user_instance_t *user, const ch
 	char txnbin[sizeof(user->txnbin)];
 	int txnlen;
 
-	txnlen = address_to_txn(txnbin, username, script, segwit, ckpool.ecash);
+	txnlen = address_to_txn(txnbin, username, script);
 	if (unlikely(txnlen < 1))
 		return false;
 	ck_wlock(&sdata->instance_lock);
@@ -10945,6 +10945,11 @@ void *stratifier(void *arg)
 	ckpool.sdata = sdata;
 	sdata->verbose = true;
 
+    if (!ckpool.ecash) {
+        LOGERR("Non-ecash mode not supported");
+        goto out;
+    }
+
 	/* Wait for the generator to have something for us */
 	while (!ckpool.proxy && !ckpool.generator_ready)
 		cksleep_ms(10);
@@ -10959,22 +10964,22 @@ void *stratifier(void *arg)
 
 		/* Store this for use elsewhere */
 		hex2bin(scriptsig_header_bin, scriptsig_header, 41);
-		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script, ckpool.segwit, ckpool.ecash);
+		sdata->txnlen = address_to_txn(sdata->txnbin, ckpool.btcaddress, ckpool.script);
 
 		/* Find a valid donation address if possible */
 		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript);
 			LOGNOTICE("Donation address valid %s/%b", ckpool.donaddress, ckpool.donsegwit);
 		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript);
 			LOGNOTICE("Testnet donation address valid %s", ckpool.donaddress);
 		} else if (generator_checkaddr(ckpool.rtdonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.rtdonaddress;
 			ckpool.donvalid = true;
-			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
+			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript);
 			LOGNOTICE("Regtest donation address valid %s", ckpool.donaddress);
 		} else
 			LOGNOTICE("No valid donation address found");

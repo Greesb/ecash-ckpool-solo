@@ -2171,7 +2171,7 @@ static uint16_t build_allocate_outputs(uint8_t *out, size_t outsz,
 	int script_len = 0;
 	uint8_t *p = out;
 	const char *addr = NULL;
-	bool script_flag = false, segwit = false;
+	bool script_flag = false;
 
 	if (outsz < 2)
 		return 0;
@@ -2217,16 +2217,14 @@ static uint16_t build_allocate_outputs(uint8_t *out, size_t outsz,
 		}
 		addr = account;
 		script_flag = scr;
-		segwit = seg;
 	} else if (ckpool.btcaddress) {
 		addr = ckpool.btcaddress;
 		script_flag = ckpool.script;
-		segwit = ckpool.segwit;
 	}
 	if (!addr)
 		return 0; /* empty outputs — JDC may still declare */
 
-	script_len = address_to_txn(script, addr, script_flag, segwit, ckpool.ecash);
+	script_len = address_to_txn(script, addr, script_flag);
 	if (script_len < 1 || script_len > 40) {
 		if (why)
 			*why = "identity has no usable output script";

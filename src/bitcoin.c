@@ -296,9 +296,7 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 	if (ckpool.ecash) {
 		yyjson_val *coinbasetxn, *minerfund, *rtt;
 		const char *minerfund_addr, *rtt_bits_hex;
-		uint64_t minerfund_amount;
-		bool script, segwit;
-		char *minerfundtxn;
+		bool script;
 		char rtt_bits[4];
 
 		coinbasetxn = yyjson_obj_get(res_val, "coinbasetxn");
@@ -315,12 +313,11 @@ bool gen_gbtbase(connsock_t *cs, gbtbase_t *gbt)
 			if (!decode_cashaddr(minerfund_addr, minerfund_prefix, 16, &script, minerfund_hash)) {
 				return false;
 			}
-			gbt->minerfund_txnlen = address_to_txn(gbt->minerfund_txn, minerfund_addr, script, /*segwit=*/false, /*cashaddr=*/true);
+			gbt->minerfund_txnlen = address_to_txn(gbt->minerfund_txn, minerfund_addr, script);
 		}
 
 		yyjson_val *stakingrewards;
 		const char *stakingrewards_script_hex;
-		uint64_t stakingrewards_amount;
 
 		stakingrewards = yyjson_obj_get(coinbasetxn, "stakingrewards");
 		stakingrewards_script_hex = yyjson_get_str(yyjson_obj_get(yyjson_obj_get(stakingrewards, "payoutscript"), "hex"));
