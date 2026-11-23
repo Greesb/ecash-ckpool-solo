@@ -85,7 +85,7 @@ bool validate_address(connsock_t *cs, const char *address, bool *script, bool *s
 	}
 	/* eCash mode only accepts cashaddr; bitcoind still reports legacy
 	 * base58 as isvalid, but the pool cannot safely pay to those. */
-	if (cs->ckp && cs->ckp->ecash) {
+	if (ckpool.ecash) {
 		char prefix[16];
 		char hash[20];
 		bool cash_script = false;

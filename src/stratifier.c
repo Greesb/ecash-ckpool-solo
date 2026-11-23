@@ -2519,6 +2519,12 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 	int submitted;
 	bool ret;
 
+	swap_256(swap256, flip32);
+	__bin2hex(rhash, swap256, 32);
+	submitted = generator_submitblock(gbt_block);
+	if (unlikely(submitted < 0))
+		save_unsubmitted_block(gbt_block, rhash, height);
+	ret = submitted > 0;
 	free(gbt_block);
 
 	// On eCash we don't want to force mining on top of the block if it is
@@ -2528,13 +2534,6 @@ static bool local_block_submit(char *gbt_block, const uchar *flip32, int height)
 		return ret;
 	}
 
-	swap_256(swap256, flip32);
-	__bin2hex(rhash, swap256, 32);
-	submitted = generator_submitblock(gbt_block);
-	if (unlikely(submitted < 0))
-		save_unsubmitted_block(gbt_block, rhash, height);
-	ret = submitted > 0;
-	free(gbt_block);
 	generator_preciousblock(rhash);
 
 	/* Check failures that may be inconclusive but were submitted via other
@@ -6336,7 +6335,7 @@ static bool user_publish_address(sdata_t *sdata, user_instance_t *user, const ch
 	char txnbin[sizeof(user->txnbin)];
 	int txnlen;
 
-	txnlen = address_to_txn(txnbin, username, script, segwit);
+	txnlen = address_to_txn(txnbin, username, script, segwit, ckpool.ecash);
 	if (unlikely(txnlen < 1))
 		return false;
 	ck_wlock(&sdata->instance_lock);
@@ -6442,18 +6441,10 @@ static user_instance_t *generate_user(stratum_instance_t *client,
 	ck_wunlock(&sdata->instance_lock);
 
 	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
-<<<<<<< HEAD
-		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
-			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckpool.ecash);
-		}
-=======
 		if (checked)
 			user_publish_address(sdata, user, username, script, segwit);
 		else
 			user_check_address(sdata, user, username);
->>>>>>> upstream/master
 	}
 	if (new_user) {
 		LOGNOTICE("Added new user %s%s", username, user->btcaddress ?
@@ -8919,18 +8910,8 @@ static user_instance_t *generate_remote_user(const char *workername)
 
 	user = get_create_user(sdata, username, &new_user);
 
-<<<<<<< HEAD
-	if (!ckpool.proxy && (new_user || !user->btcaddress)) {
-		/* Is this a btc address based username? */
-		if (generator_checkaddr(username, &user->script, &user->segwit)) {
-			user->btcaddress = true;
-			user->txnlen = address_to_txn(user->txnbin, username, user->script, user->segwit, ckpool.ecash);
-		}
-	}
-=======
 	if (!ckpool.proxy && (new_user || !user->btcaddress))
 		user_check_address(sdata, user, username);
->>>>>>> upstream/master
 	if (new_user) {
 		LOGNOTICE("Added new remote user %s%s", username, user->btcaddress ?
 			  " as address based registration" : "");
@@ -10984,7 +10965,7 @@ void *stratifier(void *arg)
 		if (generator_checkaddr(ckpool.donaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donvalid = true;
 			sdata->dontxnlen = address_to_txn(sdata->dontxnbin, ckpool.donaddress, ckpool.donscript, ckpool.donsegwit, ckpool.ecash);
-			LOGNOTICE("Donation address valid %s", ckpool.donaddress);
+			LOGNOTICE("Donation address valid %s/%b", ckpool.donaddress, ckpool.donsegwit);
 		} else if (generator_checkaddr(ckpool.tndonaddress, &ckpool.donscript, &ckpool.donsegwit)) {
 			ckpool.donaddress = ckpool.tndonaddress;
 			ckpool.donvalid = true;

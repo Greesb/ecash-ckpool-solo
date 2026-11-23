@@ -1810,7 +1810,6 @@ static bool bech32_decode(uint8_t *data, const int data_size, int *data_len,
 	if (unlikely(dlen > data_size))
 		return false;
 	for (i = 0; i < dlen; i++) {
-		char c = input[hrp_len + 1 + i];
 		int v = bech32(input[i]);
 
 		if (unlikely(v < 0))
@@ -1926,7 +1925,7 @@ bool decode_cashaddr(const char *addr, char *prefix, int prefix_len, bool *scrip
 			// The separator cannot be the first character, cannot have number
 			// and there must not be 2 separators.
 			if (hasNumber || i == 0 || prefix_char_count != 0) {
-				LOGERR("Invalid prefix in cash address %s\n, addr");
+				LOGERR("Invalid prefix in cash address %s\n", addr);
 				return false;
 			}
 
